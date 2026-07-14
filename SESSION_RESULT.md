@@ -11,7 +11,7 @@
 - Counterpart repo pre-this-round HEAD: `345242d1641950f9f4715714240396ef04063e14`
 - Counterpart repo Implementation SHA: `6e20fe8210edc3b6aba5bb01fcf69cbba308a109`
 - Contract version: `1.0.0`
-- Status: `IMPLEMENTATION_FINISHED` / `AWAITING_CODEX_REVIEW` (this session does not declare Foundation "FOUNDATION COMPLETE"/"CODEX VERIFIED"/"contract-v1 확정"/"Wave 1 READY" - Codex re-verification and user testing are still outstanding)
+- Status: `IMPLEMENTATION_FINISHED` / `AWAITING_CODEX_REVIEW` (this session does not claim the Foundation work is finalized, independently verified, or ready for downstream consumption - Codex re-verification and user testing are still outstanding)
 
 ## Codex re-verification round - 23-item checklist
 

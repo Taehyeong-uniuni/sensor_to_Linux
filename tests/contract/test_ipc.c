@@ -431,8 +431,8 @@ static void test_ipc_002(void)
     static const char *const RESYNC_PAYLOADS[] = {
         "{\"jsonConfigDto\":{}}",
         "{\"jsonDeviceDto\":{}}",
-        "{\"AlertLedState\":0,\"AlertTime\":0,\"AlertSec\":0}",
-        "{\"PwrLedState\":0}",
+        "{\"AlertLedState\":\"0\",\"AlertTime\":\"0\",\"AlertSec\":\"0\"}",
+        "{\"PwrLedState\":\"0\"}",
     };
     int resync_ok = 1;
     for (size_t i = 0; i < sizeof(RESYNC_ACTIONS) / sizeof(RESYNC_ACTIONS[0]); i++) {
