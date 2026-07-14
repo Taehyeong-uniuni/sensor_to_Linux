@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://savvy.internal/contracts/mgr_sensor_ipc.schema.json",
+  "title": "MGR-Sensor IPC envelope (FND-03)",
+  "description": "Production message envelope exchanged over the AF_UNIX SOCK_SEQPACKET transport between the MGR (server) and Sensor (client) daemons - one JSON object per SOCK_SEQPACKET record. SOCK_SEQPACKET already preserves record boundaries, so no delimiter or length-prefix framing is added on top of this envelope (see 08_BLOCKERS.md DEC-20260714-02). Encoded size (action+payload together) must not exceed 65536 bytes; this is enforced by the application layer before send(), not expressed in this schema. Duplicate JSON keys within any schema-controlled object (this envelope root, payload, and any nested DTO such as jsonConfigDto/jsonDeviceDto) are rejected at parse time by the codec - a JSON Schema over an already-parsed object cannot see duplicate keys, since a conforming parser has already collapsed them, so that rule is enforced in src/protocol code, not here.",
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Existing Android MGR<->Sensor action name. Foundation introduces no new action names. The concrete action catalog (direction, payload keys/types, reconnect replay/drop behavior per action) is tracked in docs/ANDROID_BEHAVIOR_MAP.md and consumed by the Wave 1 sessions that implement each action (CC-MGR-CORE, CC-SENSOR-CORE, etc.) - this schema fixes only the envelope shape common to every action."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Required even when an action carries no data - use payload: {}, never omit this field."
+    }
+  },
+  "required": ["action", "payload"],
+  "additionalProperties": false,
+  "$comment": "additionalProperties:false at the root blocks new top-level product fields (e.g. version/sequence/request_id are explicitly forbidden - sequence is transport-internal metadata only, never a product field). It does not and cannot express duplicate-key rejection; see the top-level description."
+}
