@@ -31,10 +31,14 @@ savvy_ipc_direction_t savvy_ipc_action_direction(const char *action);
  * present (required or optional) must have the catalog-declared JSON
  * type (object/string/number) - e.g. CONFIG's {"jsonConfigDto":"not-an-
  * object"} is rejected even though the key exists, because the catalog
- * declares jsonConfigDto as an object. Returns SAVVY_ERR_PROTOCOL if
- * `action` is unknown/excluded, if `payload_json` fails to parse or is
- * not an object, if a required key is absent, or if any present key's
- * type mismatches. */
+ * declares jsonConfigDto as an object. A present key whose value is JSON
+ * null is accepted only if the catalog marks that key nullable (e.g.
+ * PROPERTY_BROADCAST_TOF's four optional fields); otherwise a present
+ * null is rejected just like any other type mismatch - missing entirely
+ * is a separate, independently-allowed case for a non-required key.
+ * Returns SAVVY_ERR_PROTOCOL if `action` is unknown/excluded, if
+ * `payload_json` fails to parse or is not an object, if a required key is
+ * absent, or if any present key's type (or null-ability) mismatches. */
 savvy_status_t savvy_ipc_action_validate_payload(const char *action, const char *payload_json);
 
 #ifdef __cplusplus

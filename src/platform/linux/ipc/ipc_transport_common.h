@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "savvy/core/error.h"
 #include "savvy/platform/ipc_transport.h"
+#include "savvy/platform/ipc_cancel.h"
 
 /* Shared, role-agnostic AF_UNIX SOCK_SEQPACKET primitives used by both the
  * MGR server role (ipc_server.c) and the Sensor client role
@@ -17,12 +18,29 @@
  * caller value should mean). Returns 1 if `fd` became ready (with
  * *out_revents set, if non-NULL, so the caller can distinguish
  * POLLERR/POLLHUP from a plain readiness signal), 0 on genuine timeout,
- * -1 on poll() failure (errno set). EINTR is retried with the same
- * (already-clamped) timeout rather than precisely recomputing a shrinking
- * deadline - simpler, and still never blocks unboundedly; an EINTR-heavy
- * environment may see a slightly longer total wait than exactly
- * timeout_ms, but never an infinite one. */
+ * -1 on poll() failure (errno set). Equivalent to
+ * savvy_ipc_poll_with_deadline_cancelable(fd, events, timeout_ms,
+ * out_revents, NULL) - kept as a separate name for callers that have no
+ * cancel source. */
 int savvy_ipc_poll_with_deadline(int fd, short events, uint32_t timeout_ms, short *out_revents);
+
+/* Like savvy_ipc_poll_with_deadline, but bounded by an ABSOLUTE
+ * CLOCK_MONOTONIC deadline armed once at entry (via savvy/core/clock.h):
+ * on EINTR, the remaining time is recomputed from that deadline and the
+ * wait resumes with exactly what's left, rather than restarting a full
+ * `timeout_ms`-length wait each time (V0B-H-02) - an EINTR-heavy
+ * environment can therefore never overshoot the caller's requested
+ * timeout by more than one syscall's scheduling slop. If `cancel` is
+ * non-NULL, its read end is polled alongside `fd`; if `cancel` becomes
+ * readable first (savvy_ipc_cancel_source_cancel() was called on it, from
+ * any thread), this returns 2 immediately, taking priority over `fd`
+ * becoming ready in the same instant. `cancel` may be NULL to disable
+ * this (identical behavior to savvy_ipc_poll_with_deadline). Returns: 1 =
+ * `fd` ready (same *out_revents semantics as above), 0 = deadline
+ * expired, -1 = poll() failure (errno set), 2 = cancelled. */
+int savvy_ipc_poll_with_deadline_cancelable(int fd, short events, uint32_t timeout_ms,
+                                             short *out_revents,
+                                             const savvy_ipc_cancel_source_t *cancel);
 
 /* Rejects with SAVVY_ERR_OVERFLOW (never calls send()) if len exceeds
  * SAVVY_IPC_MAX_MESSAGE - the kernel does not enforce this cap for

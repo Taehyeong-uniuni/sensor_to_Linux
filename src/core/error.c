@@ -14,6 +14,7 @@ const char *savvy_status_str(savvy_status_t status)
     case SAVVY_ERR_NOT_STARTED: return "NOT_STARTED";
     case SAVVY_ERR_CLOSED: return "CLOSED";
     case SAVVY_ERR_OVERFLOW: return "OVERFLOW";
+    case SAVVY_ERR_CANCELLED: return "CANCELLED";
     case SAVVY_ERR_UNKNOWN:
     default: return "UNKNOWN";
     }

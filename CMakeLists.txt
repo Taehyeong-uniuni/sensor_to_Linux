@@ -20,6 +20,9 @@ option(SAVVY_BUILD_TESTS "Build contract tests" ON)
 add_subdirectory(third_party/cJSON)
 add_subdirectory(src/core)
 add_subdirectory(src/protocol)
+# Portable (no Linux-only syscalls) - builds on host-mac and host-linux alike,
+# unlike src/platform/linux/ipc below.
+add_subdirectory(src/platform/interfaces)
 if(SAVVY_IPC_REAL_TRANSPORT)
     add_subdirectory(src/platform/linux/ipc)
 endif()

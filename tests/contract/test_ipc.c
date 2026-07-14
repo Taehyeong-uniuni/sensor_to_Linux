@@ -29,7 +29,13 @@
 #include <sys/un.h>
 #include <sys/types.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/wait.h>
 #include "savvy/platform/ipc_client.h"
+#include "savvy/platform/ipc_reconnect.h"
+#include "savvy/platform/ipc_cancel.h"
 #include "savvy/protocol/ipc_envelope.h"
 #include "savvy/protocol/ipc_action_catalog.h"
 
@@ -119,23 +125,28 @@ static const catalog_test_case_t CATALOG_CASES[] = {
     { "com.uniuni.savvysensor.sensor.reset", "{\"RESET\":\"LED\"}", "{\"RESET\":true}" },
     { "com.uniuni.savvysensor.sensor.beaconnotify", "{}", NULL },
     { "com.uniuni.savvysensor.sensor.apkupdate", "{}", NULL },
-    { "com.uniuni.savvysensor.sensor.status.ledpwr", "{\"PwrLedState\":1}", "{\"PwrLedState\":\"1\"}" },
+    /* PwrLedState/AlertLedState/AlertTime/AlertSec/STATE/IFCOMM_START/
+     * DELAY_SEC are Android Bundle Strings on the wire (V0R-H-01) - valid
+     * payloads use JSON strings; the mismatch variant is a JSON number,
+     * which is now the type that must be REJECTED (the inverse of what
+     * these vectors tested before the fix). */
+    { "com.uniuni.savvysensor.sensor.status.ledpwr", "{\"PwrLedState\":\"1\"}", "{\"PwrLedState\":1}" },
     { "com.uniuni.savvysensor.sensor.status.alert",
-      "{\"AlertLedState\":1,\"AlertTime\":2,\"AlertSec\":3}",
-      "{\"AlertLedState\":\"x\",\"AlertTime\":2,\"AlertSec\":3}" },
+      "{\"AlertLedState\":\"1\",\"AlertTime\":\"2\",\"AlertSec\":\"3\"}",
+      "{\"AlertLedState\":1,\"AlertTime\":\"2\",\"AlertSec\":\"3\"}" },
     { "com.uniuni.savvysensor.sensor.rknn.alert", "{}", NULL },
     { "com.uniuni.savvysensor.sensor.update.threash.hold", "{}", NULL },
     { "com.uniuni.savvysensor.sensor.rknn.anal.result", "{\"rknnAnalResult\":\"RET:level03\"}", "{\"rknnAnalResult\":42}" },
     { "com.uniuni.savvysensor.sensor.max.cpu.temp", "{}", NULL },
     { "com.uniuni.savvymgr.ipc.connect", "{}", NULL },
-    { "com.uniuni.savvymgr.getstate.sensor", "{\"SENSOR\":\"MIC\",\"STATE\":1}", "{\"SENSOR\":\"MIC\",\"STATE\":\"1\"}" },
-    { "com.uniuni.savvymgr.alert.sensor", "{\"IFCOMM_START\":1}", "{\"IFCOMM_START\":\"S\"}" },
+    { "com.uniuni.savvymgr.getstate.sensor", "{\"SENSOR\":\"MIC\",\"STATE\":\"1\"}", "{\"SENSOR\":\"MIC\",\"STATE\":1}" },
+    { "com.uniuni.savvymgr.alert.sensor", "{\"IFCOMM_START\":\"1\"}", "{\"IFCOMM_START\":1}" },
     { "com.uniuni.savvymgr.upload.sensor",
       "{\"targetFilePath\":\"/base/x\",\"targetFileNm\":\"y\"}",
       "{\"targetFilePath\":1,\"targetFileNm\":\"y\"}" },
-    { "com.uniuni.savvymgr.restart.sensor", "{\"DELAY_SEC\":5}", "{\"DELAY_SEC\":\"5\"}" },
+    { "com.uniuni.savvymgr.restart.sensor", "{\"DELAY_SEC\":\"5\"}", "{\"DELAY_SEC\":5}" },
     { "com.uniuni.savvymgr.fracture.sensor", "{}", NULL },
-    { "com.uniuni.savvymgr.tof.property", "{}", NULL }, /* all 4 keys optional - empty payload is valid */
+    { "com.uniuni.savvymgr.tof.property", "{}", NULL }, /* all 4 keys optional+nullable - see dedicated matrix below */
     { "com.uniuni.savvymgr.update.threash.rslt", "{\"rslt\":\"True\"}", "{\"rslt\":1}" },
 };
 #define N_CATALOG_CASES (sizeof(CATALOG_CASES) / sizeof(CATALOG_CASES[0]))
@@ -207,6 +218,54 @@ static void test_ipc_001(void)
     CHECK("001 all 23 catalog actions: valid payload parses+validates OK", all_valid_ok);
     CHECK("001 all applicable catalog actions: type-mismatch payload rejected", all_mismatch_ok);
 
+    /* PROPERTY_BROADCAST_TOF's four keys are both optional (may be
+     * missing) AND nullable (may be present as JSON null) - V0R-H-01
+     * requires these as four independently distinguishable cases, which
+     * the generic valid/type-mismatch pair above can't express. Checked
+     * directly against the catalog validator (no transport round-trip
+     * needed - this is purely catalog/type-validation logic). */
+    {
+        const char *action = "com.uniuni.savvymgr.tof.property";
+        savvy_status_t s;
+
+        s = savvy_ipc_action_validate_payload(action, "{}");
+        CHECK("001 TOF: optional key missing -> OK", s == SAVVY_OK);
+
+        s = savvy_ipc_action_validate_payload(action,
+            "{\"TofTemperature\":null,\"TofTemperDrv\":null,\"SmokeValue\":null,\"MicValue\":null}");
+        CHECK("001 TOF: nullable key present as null -> OK", s == SAVVY_OK);
+
+        s = savvy_ipc_action_validate_payload(action, "{\"TofTemperature\":42}");
+        CHECK("001 TOF: optional key present with valid type -> OK", s == SAVVY_OK);
+
+        s = savvy_ipc_action_validate_payload(action, "{\"TofTemperature\":\"42\"}");
+        CHECK("001 TOF: optional key present with invalid (non-null) type -> reject",
+              s == SAVVY_ERR_PROTOCOL);
+    }
+
+    /* A required, non-nullable key (PwrLedState) present as JSON null must
+     * be rejected - distinct from a required key being absent entirely
+     * (already covered: no catalog action has both required=true and
+     * nullable=true, so this is the general "non-nullable key is null"
+     * case using one representative field). */
+    {
+        savvy_status_t s = savvy_ipc_action_validate_payload(
+            "com.uniuni.savvysensor.sensor.status.ledpwr", "{\"PwrLedState\":null}");
+        CHECK("001 non-nullable required key (PwrLedState) present as null -> reject",
+              s == SAVVY_ERR_PROTOCOL);
+    }
+
+    /* Payload root itself is not a JSON object at all (bare string/array),
+     * as opposed to a nested key having the wrong type. */
+    {
+        savvy_status_t s = savvy_ipc_action_validate_payload(
+            "com.uniuni.savvysensor.serverip", "\"not-an-object\"");
+        CHECK("001 payload root not an object (bare string) -> reject", s == SAVVY_ERR_PROTOCOL);
+
+        s = savvy_ipc_action_validate_payload("com.uniuni.savvysensor.serverip", "[1,2,3]");
+        CHECK("001 payload root not an object (array) -> reject", s == SAVVY_ERR_PROTOCOL);
+    }
+
     /* Missing "action" field entirely. */
     {
         const char *bad = "{\"payload\":{}}";
@@ -244,6 +303,44 @@ static void test_ipc_001(void)
     unlink(path);
 }
 
+/* F-07: mock replay recorder for savvy_ipc_reconnect_tracker_*. Records
+ * call counts and relative order (via a shared monotonic index) rather
+ * than actually resending anything - proving the hook itself fires
+ * correctly is decoupled from proving the transport can carry the actual
+ * replay messages (already covered by the RESYNC_ACTIONS loop below). */
+typedef struct reconnect_recorder {
+    int config_calls;
+    int device_calls;
+    int config_call_index;  /* 0 = never called this round */
+    int device_call_index;
+    int next_index;
+    savvy_ipc_transport_t *already_closed_transport; /* used to simulate a callback-internal failure */
+    savvy_status_t simulated_failure_status;
+} reconnect_recorder_t;
+
+static void recorder_request_config(void *user_data)
+{
+    reconnect_recorder_t *r = (reconnect_recorder_t *)user_data;
+    r->config_calls++;
+    r->config_call_index = ++r->next_index;
+    /* Simulate a real, internal callback failure (e.g. the actual resend
+     * racing a second disconnect) by sending through an already-closed
+     * transport - this must return an error, not crash, and the tracker/
+     * caller must keep going regardless (F-07: "콜백 실패 시 process crash
+     * 없음"). */
+    if (r->already_closed_transport != NULL) {
+        r->simulated_failure_status = r->already_closed_transport->send(
+            r->already_closed_transport, "x", 1, TEST_TIMEOUT_MS);
+    }
+}
+
+static void recorder_request_device(void *user_data)
+{
+    reconnect_recorder_t *r = (reconnect_recorder_t *)user_data;
+    r->device_calls++;
+    r->device_call_index = ++r->next_index;
+}
+
 /* ---- CT-IPC-002: connect -> send/recv -> disconnect -> reconnect -> 4-message resync; pre-connect send drop ---- */
 static void test_ipc_002(void)
 {
@@ -266,6 +363,17 @@ static void test_ipc_002(void)
     CHECK("002 client connect ok", st == SAVVY_OK);
     int server_peer_fd = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
     CHECK("002 raw server accepts", server_peer_fd >= 0);
+
+    /* F-07: the FIRST successful connect is normal startup, not a
+     * reconnect - the replay hook must not fire. */
+    savvy_ipc_reconnect_tracker_t reconnect_tracker;
+    savvy_ipc_reconnect_tracker_init(&reconnect_tracker);
+    reconnect_recorder_t recorder;
+    memset(&recorder, 0, sizeof(recorder));
+    savvy_ipc_reconnect_hooks_t hooks = { recorder_request_config, recorder_request_device, &recorder };
+    savvy_ipc_reconnect_tracker_on_connected(&reconnect_tracker, &hooks);
+    CHECK("002 F-07: first connect does not fire the replay hook",
+          recorder.config_calls == 0 && recorder.device_calls == 0);
 
     /* Send/recv content match, using a real cataloged action. */
     char *env_text = NULL; size_t env_len = 0;
@@ -298,6 +406,21 @@ static void test_ipc_002(void)
     CHECK("002 client reconnect ok", st == SAVVY_OK);
     int server_peer_fd2 = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
     CHECK("002 raw server re-accepts after reconnect", server_peer_fd2 >= 0);
+
+    /* F-07: reconnect must fire the replay hook exactly once, Config
+     * before Device. The recorder's request_config callback also
+     * exercises a real internal failure (a send() through the
+     * already-closed first `transport`) to prove a callback failure
+     * doesn't crash the process or block the hook from completing. */
+    recorder.already_closed_transport = &transport;
+    savvy_ipc_reconnect_tracker_on_connected(&reconnect_tracker, &hooks);
+    CHECK("002 F-07: reconnect fires the replay hook exactly once",
+          recorder.config_calls == 1 && recorder.device_calls == 1);
+    CHECK("002 F-07: replay hook calls Config before Device",
+          recorder.config_call_index > 0 && recorder.device_call_index > 0 &&
+          recorder.config_call_index < recorder.device_call_index);
+    CHECK("002 F-07: callback-internal failure (send on closed transport) reported, not crashed",
+          recorder.simulated_failure_status != SAVVY_OK);
 
     static const char *const RESYNC_ACTIONS[] = {
         "com.uniuni.savvysensor.config",
@@ -337,8 +460,31 @@ static void test_ipc_002(void)
     }
     CHECK("002 resync: CONFIG+DEVICE+STATUS_ALERT+STATUS_LED_PWR all deliverable after reconnect", resync_ok);
 
+    /* F-07: a SECOND reconnect must fire the hook again (once each), not
+     * just the first time - and the transport carrying the resync
+     * messages above (after the first reconnect's hook fired, including
+     * its simulated internal failure) must still be fully functional,
+     * which the resync check just above already proved. */
     close(server_peer_fd2);
+    char probe2[16];
+    size_t probe2_len = 0;
+    st = transport2.recv(&transport2, probe2, sizeof(probe2), &probe2_len, TEST_TIMEOUT_MS);
+    CHECK("002 second disconnect detected as recv()==0", st == SAVVY_OK && probe2_len == 0);
     transport2.close(&transport2);
+
+    savvy_ipc_transport_t transport3;
+    st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &transport3);
+    CHECK("002 client second reconnect ok", st == SAVVY_OK);
+    int server_peer_fd3 = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
+    CHECK("002 raw server re-accepts after second reconnect", server_peer_fd3 >= 0);
+
+    recorder.already_closed_transport = NULL;
+    savvy_ipc_reconnect_tracker_on_connected(&reconnect_tracker, &hooks);
+    CHECK("002 F-07: second reconnect fires the replay hook again, once each (not just the first time)",
+          recorder.config_calls == 2 && recorder.device_calls == 2);
+
+    close(server_peer_fd3);
+    transport3.close(&transport3);
     close(listen_fd);
     unlink(path);
 }
@@ -387,6 +533,42 @@ static void test_ipc_003(void)
         st = transport.send(&transport, env, env_len, TEST_TIMEOUT_MS);
         CHECK("003 65537B real envelope rejected before send() (transport-level cap)", st == SAVVY_ERR_OVERFLOW);
         free(env);
+    }
+
+    /* F-08: independent of the client-side send() guard just above, the
+     * RECEIVER's own 64KiB global cap must catch an oversized record even
+     * when the caller's receive buffer is large enough that MSG_TRUNC
+     * would NOT be what catches it - i.e. the cap is its own check, not
+     * merely a side effect of a too-small caller buffer (this is the
+     * F-06/M-05 fix). Raw send bypasses the client-side guard entirely
+     * (same technique as the MSG_TRUNC case below), but this time with a
+     * receiver buffer deliberately larger than the oversized record
+     * itself. */
+    {
+        size_t oversized_len = SAVVY_IPC_MAX_MESSAGE + 1;
+        uint8_t *big = (uint8_t *)malloc(oversized_len);
+        memset(big, 'D', oversized_len);
+        ssize_t sent = send(server_peer_fd, big, oversized_len, 0); /* raw send from the test server, bypassing the 64KiB app cap on purpose */
+        uint8_t *big_cap = (uint8_t *)malloc(oversized_len + 1024); /* deliberately bigger than the record itself */
+        size_t out_len = 999;
+        st = transport.recv(&transport, big_cap, oversized_len + 1024, &out_len, TEST_TIMEOUT_MS);
+        CHECK("003 65537B raw record rejected by the receiver's OWN global cap even with a large-enough buffer (not merely MSG_TRUNC)",
+              sent == (ssize_t)oversized_len && st == SAVVY_ERR_OVERFLOW);
+        free(big);
+        free(big_cap);
+    }
+
+    /* And exactly like the MSG_TRUNC case below, a normal record sent
+     * right after must still be received uncorrupted. */
+    {
+        const char *normal = "{\"action\":\"com.uniuni.savvymgr.fracture.sensor\",\"payload\":{}}";
+        size_t normal_len = strlen(normal);
+        ssize_t sent = send(server_peer_fd, normal, normal_len, 0);
+        char rx[256]; size_t out_len = 0;
+        st = transport.recv(&transport, rx, sizeof(rx), &out_len, TEST_TIMEOUT_MS);
+        CHECK("003 normal record after the receiver-side-cap-rejected one is received uncorrupted",
+              sent == (ssize_t)normal_len && st == SAVVY_OK && out_len == normal_len &&
+              memcmp(rx, normal, normal_len) == 0);
     }
 
     /* A single record larger than the receiver's buffer cap is detected
@@ -442,10 +624,413 @@ static void test_ipc_003(void)
     unlink(path);
 }
 
+/* ---- Supplementary (not one of the 8 required CT-* tests): V0B-H-02
+ * strict cancellable I/O. Registered under CTest name CT-IPC-CANCEL (not
+ * CT-IPC-004) specifically so it can never be mistaken for a renumbering
+ * of, or replacement for, the required CT-IPC-001~003. ---- */
+
+/* Blocks (via pthread_join with a bounded wait) instead of hanging the
+ * whole suite forever if a fix regresses - a join that doesn't complete
+ * within timeout_ms is itself the test failure, not a hang. */
+static int join_with_timeout(pthread_t thread, int timeout_ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+    return pthread_timedjoin_np(thread, NULL, &ts);
+}
+
+static uint64_t wall_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+typedef struct blocked_call_result {
+    savvy_ipc_transport_t *transport;
+    savvy_status_t status;
+    size_t out_len;
+} blocked_call_result_t;
+
+static void *blocked_recv_thread(void *arg)
+{
+    blocked_call_result_t *r = (blocked_call_result_t *)arg;
+    char buf[64];
+    /* 30s: must be woken by the main thread's close(), not by this
+     * elapsing - if the fix regresses, join_with_timeout() below fails
+     * long before this would. */
+    r->status = r->transport->recv(r->transport, buf, sizeof(buf), &r->out_len, 30000u);
+    return NULL;
+}
+
+static void *blocked_send_thread(void *arg)
+{
+    blocked_call_result_t *r = (blocked_call_result_t *)arg;
+    char payload[512];
+    memset(payload, 'S', sizeof(payload));
+    /* Keep sending until send() itself reports a non-OK status (either
+     * because the (small, deliberately-shrunk) send buffer is genuinely
+     * full and this particular call is the one that ends up blocked when
+     * the peer closes, or because an earlier call already failed) -
+     * whichever happens, the LAST attempted status is what matters. */
+    for (int i = 0; i < 100000; i++) {
+        r->status = r->transport->send(r->transport, payload, sizeof(payload), 30000u);
+        if (r->status != SAVVY_OK) {
+            break;
+        }
+    }
+    return NULL;
+}
+
+typedef struct blocked_connect_result {
+    const char *path;
+    const savvy_ipc_cancel_source_t *cancel;
+    savvy_status_t status;
+} blocked_connect_result_t;
+
+static void *blocked_connect_thread(void *arg)
+{
+    blocked_connect_result_t *r = (blocked_connect_result_t *)arg;
+    savvy_ipc_transport_t transport;
+    r->status = savvy_ipc_client_connect_cancelable(r->path, 30000u, r->cancel, &transport);
+    if (r->status == SAVVY_OK) {
+        transport.close(&transport);
+    }
+    return NULL;
+}
+
+static void noop_signal_handler(int sig) { (void)sig; }
+
+static void test_ipc_004(void)
+{
+    /* A: a thread blocked in recv() wakes promptly when another thread
+     * closes the same transport (V0B-H-02 "read 대기 중 close/cancel"). */
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        savvy_ipc_transport_t transport;
+        savvy_status_t st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &transport);
+        int server_peer_fd = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
+        CHECK("004A setup: connected", st == SAVVY_OK && server_peer_fd >= 0);
+
+        blocked_call_result_t result = { &transport, SAVVY_ERR_UNKNOWN, 999 };
+        pthread_t th;
+        pthread_create(&th, NULL, blocked_recv_thread, &result);
+        struct timespec settle = { 0, 100000000L }; /* 100ms: let the thread actually enter recv() */
+        nanosleep(&settle, NULL);
+
+        transport.close(&transport);
+        int joined = join_with_timeout(th, 2000);
+        CHECK("004A blocked reader wakes promptly on another thread's close() (not after the full 30s timeout)",
+              joined == 0);
+        if (joined != 0) {
+            pthread_cancel(th);
+            pthread_join(th, NULL);
+        }
+
+        close(server_peer_fd);
+        close(listen_fd);
+        unlink(path);
+    }
+
+    /* B: a thread blocked in send() (send buffer deliberately shrunk and
+     * filled, peer never draining) wakes promptly when another thread
+     * closes the same transport (V0B-H-02 "write 대기 중 close/cancel"). */
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        savvy_ipc_transport_t transport;
+        savvy_status_t st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &transport);
+        int server_peer_fd = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
+        CHECK("004B setup: connected", st == SAVVY_OK && server_peer_fd >= 0);
+
+        int fd = (int)(intptr_t)transport.impl;
+        int small_buf = 1024;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small_buf, sizeof(small_buf));
+
+        blocked_call_result_t result = { &transport, SAVVY_ERR_UNKNOWN, 0 };
+        pthread_t th;
+        pthread_create(&th, NULL, blocked_send_thread, &result);
+        struct timespec settle = { 0, 200000000L }; /* 200ms: let the sender genuinely fill the buffer and block */
+        nanosleep(&settle, NULL);
+
+        transport.close(&transport);
+        int joined = join_with_timeout(th, 2000);
+        CHECK("004B blocked writer wakes promptly on another thread's close() (not after the full 30s timeout)",
+              joined == 0);
+        CHECK("004B blocked writer's send() reports a failure, not a stale success",
+              joined == 0 && result.status != SAVVY_OK);
+        if (joined != 0) {
+            pthread_cancel(th);
+            pthread_join(th, NULL);
+        }
+
+        close(server_peer_fd);
+        close(listen_fd);
+        unlink(path);
+    }
+
+    /* C: connect() cancellation (V0B-H-02 "connect 대기 중 cancel") - this
+     * repo owns the CLIENT role, so savvy_ipc_client_connect_cancelable is
+     * exactly the production function this exercises (mgr_to_Linux's
+     * counterpart tests savvy_ipc_server_accept_cancelable instead, since
+     * it owns the SERVER role, and proves the SAME shared
+     * savvy_ipc_poll_with_deadline_cancelable() primitive genuinely
+     * interrupts a peer-less, indefinitely-blocked wait).
+     *
+     * Two sub-cases, because AF_UNIX loopback connect() completes near-
+     * instantaneously in practice - empirically, exhausting
+     * raw_server_listen's backlog(1) with one un-accepted connection does
+     * NOT reliably make a second connect() block long enough to race a
+     * cancellation delivered ~200ms later (observed directly against this
+     * Docker image: the second connect legitimately succeeds first). So:
+     *   C1 (best-effort, not a hard failure either way): attempt the
+     *       backlog-exhaustion scenario anyway and confirm it never hangs
+     *       and always resolves to a definite status - documents the
+     *       above finding rather than asserting a specific status.
+     *   C2 (deterministic, the real assertion for this finding): cancel
+     *       the source BEFORE calling connect_cancelable() at all, against
+     *       a listener that WOULD otherwise accept it fine - this exactly
+     *       exercises the shared poll_with_deadline_cancelable's
+     *       cancel-fd check without depending on any OS-specific blocking
+     *       timing, and must return SAVVY_ERR_CANCELLED, quickly, every
+     *       time. */
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        CHECK("004C setup: raw server listening", listen_fd >= 0);
+
+        savvy_ipc_transport_t occupying_transport;
+        savvy_status_t occ_st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &occupying_transport);
+        CHECK("004C setup: first connect occupies the only backlog slot", occ_st == SAVVY_OK);
+
+        savvy_ipc_cancel_source_t cancel;
+        savvy_status_t cs_st = savvy_ipc_cancel_source_init(&cancel);
+        CHECK("004C cancel source created", cs_st == SAVVY_OK);
+
+        blocked_connect_result_t result = { path, &cancel, SAVVY_ERR_UNKNOWN };
+        pthread_t th;
+        pthread_create(&th, NULL, blocked_connect_thread, &result);
+        struct timespec settle = { 0, 200000000L };
+        nanosleep(&settle, NULL);
+
+        savvy_ipc_cancel_source_cancel(&cancel);
+        int joined = join_with_timeout(th, 2000);
+        CHECK("004C1 backlog-exhaustion connect attempt never hangs regardless of whether it wins the race "
+              "(not after the full 30s timeout)", joined == 0);
+        if (joined != 0) {
+            pthread_cancel(th);
+            pthread_join(th, NULL);
+        } else if (result.status != SAVVY_OK) {
+            /* If it didn't just succeed outright (this environment's
+             * observed behavior), it must specifically be CANCELLED, not
+             * some other unrelated failure. */
+            CHECK("004C1 non-successful backlog-exhaustion connect is specifically SAVVY_ERR_CANCELLED",
+                  result.status == SAVVY_ERR_CANCELLED);
+        }
+
+        savvy_ipc_cancel_source_destroy(&cancel);
+        occupying_transport.close(&occupying_transport);
+        close(listen_fd);
+        unlink(path);
+    }
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        CHECK("004C2 setup: raw server listening", listen_fd >= 0);
+
+        savvy_ipc_cancel_source_t cancel;
+        savvy_status_t cs_st = savvy_ipc_cancel_source_init(&cancel);
+        savvy_ipc_cancel_source_cancel(&cancel); /* cancelled BEFORE the call even starts */
+        CHECK("004C2 cancel source created and pre-cancelled", cs_st == SAVVY_OK);
+
+        savvy_ipc_transport_t transport;
+        uint64_t before = wall_ms();
+        savvy_status_t st = savvy_ipc_client_connect_cancelable(path, 30000u, &cancel, &transport);
+        uint64_t elapsed = wall_ms() - before;
+        CHECK("004C2 already-cancelled source makes connect_cancelable return SAVVY_ERR_CANCELLED promptly "
+              "(not after 30s, and not a successful connect)",
+              st == SAVVY_ERR_CANCELLED && elapsed < 2000);
+
+        savvy_ipc_cancel_source_destroy(&cancel);
+        close(listen_fd);
+        unlink(path);
+    }
+
+    /* D: with nothing cancelling and nothing sent, a bounded recv() still
+     * times out at roughly the requested deadline (V0B-H-02 "timeout
+     * 발생") - a regression that made everything wait for cancellation
+     * only, and broke the plain timeout path, would show up here. */
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        savvy_ipc_transport_t transport;
+        savvy_status_t st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &transport);
+        int server_peer_fd = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
+        CHECK("004D setup: connected", st == SAVVY_OK && server_peer_fd >= 0);
+
+        char buf[16]; size_t out_len = 999;
+        uint64_t before = wall_ms();
+        st = transport.recv(&transport, buf, sizeof(buf), &out_len, 400u);
+        uint64_t elapsed = wall_ms() - before;
+        CHECK("004D plain timeout still returns SAVVY_ERR_TIMEOUT at roughly the requested deadline",
+              st == SAVVY_ERR_TIMEOUT && elapsed >= 350 && elapsed < 2000);
+
+        close(server_peer_fd);
+        transport.close(&transport);
+        close(listen_fd);
+        unlink(path);
+    }
+
+    /* E: repeated EINTR must not reset the deadline from scratch each
+     * time (V0B-H-02 "반복 EINTR에도 absolute deadline 초과 금지"). A
+     * no-op-handled signal delivered every ~50ms for ~2s would keep
+     * pushing a naively-restarted wait far past the 500ms this call
+     * actually asked for; the absolute-deadline design must still return
+     * at roughly 500ms regardless. SA_RESTART is deliberately NOT set, so
+     * every delivered signal is guaranteed to actually interrupt poll(). */
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        savvy_ipc_transport_t transport;
+        savvy_status_t st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &transport);
+        int server_peer_fd = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
+        CHECK("004E setup: connected", st == SAVVY_OK && server_peer_fd >= 0);
+
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = noop_signal_handler;
+        sa.sa_flags = 0; /* explicitly no SA_RESTART */
+        sigaction(SIGUSR1, &sa, NULL);
+
+        /* A forked child (not another pthread) sends the signals: at this
+         * point in the test the parent process is single-threaded again
+         * (previous sub-tests already joined their threads), so a
+         * process-directed signal is unambiguously delivered to the one
+         * thread blocked in recv() below - no thread-targeting needed. */
+        pid_t child = fork();
+        if (child == 0) {
+            for (int i = 0; i < 40; i++) {
+                kill(getppid(), SIGUSR1);
+                struct timespec iv = { 0, 50000000L };
+                nanosleep(&iv, NULL);
+            }
+            _exit(0);
+        }
+
+        char buf[16]; size_t out_len = 999;
+        uint64_t before = wall_ms();
+        st = transport.recv(&transport, buf, sizeof(buf), &out_len, 500u);
+        uint64_t elapsed = wall_ms() - before;
+        CHECK("004E repeated EINTR does not reset the absolute deadline (returns at ~500ms, not ~2s+)",
+              st == SAVVY_ERR_TIMEOUT && elapsed >= 450 && elapsed < 1500);
+
+        int wstatus = 0;
+        waitpid(child, &wstatus, 0);
+
+        close(server_peer_fd);
+        transport.close(&transport);
+        close(listen_fd);
+        unlink(path);
+    }
+
+    /* F: close() is idempotent when called twice in a row. */
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        savvy_ipc_transport_t transport;
+        savvy_status_t st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &transport);
+        int server_peer_fd = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
+        CHECK("004F setup: connected", st == SAVVY_OK && server_peer_fd >= 0);
+
+        transport.close(&transport);
+        transport.close(&transport); /* must not crash / double-free / double-close */
+        char buf[16]; size_t out_len = 0;
+        st = transport.recv(&transport, buf, sizeof(buf), &out_len, TEST_TIMEOUT_MS);
+        CHECK("004F double-close is idempotent and post-close recv() reports SAVVY_ERR_CLOSED",
+              st == SAVVY_ERR_CLOSED);
+
+        close(server_peer_fd);
+        close(listen_fd);
+        unlink(path);
+    }
+
+    /* G: after a cancelled/closed transport, BOTH (a) a brand new
+     * transport instance can still be created normally, and (b) a
+     * DIFFERENT, already-established transport instance is entirely
+     * unaffected by the first one's failure. */
+    {
+        char path_a[108], path_b[108];
+        snprintf(path_a, sizeof(path_a), "/tmp/savvy-test-ipc-%d-a.sock", (int)getpid());
+        snprintf(path_b, sizeof(path_b), "/tmp/savvy-test-ipc-%d-b.sock", (int)getpid());
+
+        int listen_fd_a = raw_server_listen(path_a);
+        savvy_ipc_transport_t transport_a;
+        savvy_status_t st_a = savvy_ipc_client_connect(path_a, TEST_TIMEOUT_MS, &transport_a);
+        int server_peer_fd_a = raw_server_accept(listen_fd_a, (int)TEST_TIMEOUT_MS);
+
+        int listen_fd_b = raw_server_listen(path_b);
+        savvy_ipc_transport_t transport_b;
+        savvy_status_t st_b = savvy_ipc_client_connect(path_b, TEST_TIMEOUT_MS, &transport_b);
+        int server_peer_fd_b = raw_server_accept(listen_fd_b, (int)TEST_TIMEOUT_MS);
+
+        CHECK("004G setup: two independent transports connected",
+              st_a == SAVVY_OK && st_b == SAVVY_OK && server_peer_fd_a >= 0 && server_peer_fd_b >= 0);
+
+        /* Kill transport_a hard. */
+        transport_a.close(&transport_a);
+        close(server_peer_fd_a);
+
+        /* transport_b must still work perfectly. */
+        const char *msg = "{\"action\":\"com.uniuni.savvymgr.fracture.sensor\",\"payload\":{}}";
+        size_t msg_len = strlen(msg);
+        st_b = transport_b.send(&transport_b, msg, msg_len, TEST_TIMEOUT_MS);
+        char rx[256];
+        ssize_t n = (st_b == SAVVY_OK) ? recv(server_peer_fd_b, rx, sizeof(rx) - 1, 0) : -1;
+        CHECK("004G one transport's close/failure does not affect a different transport instance",
+              st_b == SAVVY_OK && n == (ssize_t)msg_len && memcmp(rx, msg, msg_len) == 0);
+
+        /* A brand new (third) transport can still be created normally
+         * afterward, on yet another path. */
+        char path_c[108];
+        snprintf(path_c, sizeof(path_c), "/tmp/savvy-test-ipc-%d-c.sock", (int)getpid());
+        int listen_fd_c = raw_server_listen(path_c);
+        savvy_ipc_transport_t transport_c;
+        savvy_status_t st_c = savvy_ipc_client_connect(path_c, TEST_TIMEOUT_MS, &transport_c);
+        int server_peer_fd_c = raw_server_accept(listen_fd_c, (int)TEST_TIMEOUT_MS);
+        CHECK("004G a brand new transport instance can still be created normally afterward",
+              st_c == SAVVY_OK && server_peer_fd_c >= 0);
+
+        close(server_peer_fd_b);
+        transport_b.close(&transport_b);
+        close(listen_fd_b);
+        unlink(path_b);
+        close(server_peer_fd_c);
+        transport_c.close(&transport_c);
+        close(listen_fd_c);
+        unlink(path_c);
+        close(listen_fd_a);
+        unlink(path_a);
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s <001|002|003>\n", argv[0]);
+        fprintf(stderr, "usage: %s <001|002|003|004>\n", argv[0]);
         return 2;
     }
 
@@ -455,6 +1040,8 @@ int main(int argc, char **argv)
         test_ipc_002();
     } else if (strcmp(argv[1], "003") == 0) {
         test_ipc_003();
+    } else if (strcmp(argv[1], "004") == 0) {
+        test_ipc_004();
     } else {
         fprintf(stderr, "unknown test id: %s\n", argv[1]);
         return 2;

@@ -17,6 +17,12 @@ typedef enum savvy_status {
     SAVVY_ERR_NOT_STARTED,
     SAVVY_ERR_CLOSED,
     SAVVY_ERR_OVERFLOW,
+    /* A caller-requested cancellation interrupted a blocked wait (V0B-H-02,
+     * e.g. savvy_ipc_server_accept_cancelable/savvy_ipc_client_connect_
+     * cancelable's `cancel` source was signaled) - distinct from
+     * SAVVY_ERR_TIMEOUT (deadline elapsed) and SAVVY_ERR_IO (a real
+     * transport/socket failure). */
+    SAVVY_ERR_CANCELLED,
     SAVVY_ERR_UNKNOWN
 } savvy_status_t;
 

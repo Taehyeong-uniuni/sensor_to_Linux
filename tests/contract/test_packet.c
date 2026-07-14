@@ -172,17 +172,56 @@ static void test_pkt_001(void)
     }
 
     /* Case F: explicit overflow rejection at the encode API boundary
-     * (F-02/L-02) - a data_len that would overflow the header+data_len
-     * addition must be rejected, not silently truncate the wire Length
-     * field or wrap the capacity check. */
+     * (F-02/L-02/F-08) - a data_len that would overflow the header+
+     * data_len addition, or that exceeds the wire Length field's 32-bit
+     * width, must be rejected, not silently truncate the wire Length
+     * field or wrap the capacity check.
+     *
+     * F-08: the previous version of this test passed `data == NULL`
+     * alongside the huge data_len, which trips savvy_packet_encode's
+     * EARLIER `data == NULL && data_len != 0` argument-validation guard
+     * before either overflow check ever runs - the test therefore always
+     * "passed" via SAVVY_ERR_INVALID_ARGUMENT without ever actually
+     * exercising the overflow guards it claims to cover. Fixed by passing
+     * a real (small, valid) non-NULL buffer instead - savvy_packet_encode
+     * must reject on data_len alone, before ever reading `data_len` bytes
+     * from it, so a small real buffer is safe to use here regardless of
+     * the (bogus) claimed length - and asserting the SPECIFIC
+     * SAVVY_ERR_OVERFLOW status each guard is documented to return,
+     * rather than tolerating SAVVY_ERR_INVALID_ARGUMENT as an alternative. */
     {
         uint8_t serial_dummy[SAVVY_PACKET_SERIAL_LEN] = {0};
+        uint8_t data_dummy[16] = {0};
         uint8_t out[64];
         size_t written = 0;
+
+        /* On this project's actual 64-bit size_t build targets (macOS/
+         * Linux arm64/x86_64), SIZE_MAX and UINT32_MAX+1 are BOTH caught
+         * by the earlier `data_len > UINT32_MAX` guard - `SIZE_MAX -
+         * SAVVY_PACKET_HEADER_LEN` is still enormously larger than
+         * UINT32_MAX, so the second, header+data_len-addition-overflow
+         * guard can never independently fire here; it exists as
+         * defense-in-depth for a hypothetical 32-bit size_t build (where
+         * data_len can never exceed UINT32_MAX in the first place, so
+         * THAT guard would be the only one able to catch an addition that
+         * wraps 32-bit size_t) - not a build configuration this test
+         * suite targets, so it isn't independently exercised here. Both
+         * cases below are still worth keeping as real, non-NULL-data
+         * regression checks against SAVVY_ERR_OVERFLOW specifically. */
         savvy_status_t st = savvy_packet_encode(1, 1, 1, 1, serial_dummy, SAVVY_PACKET_SERIAL_LEN,
-                                                 NULL, SIZE_MAX, out, sizeof(out), &written);
-        CHECK("001f data_len == SIZE_MAX rejected (would overflow header+data_len)",
-              st == SAVVY_ERR_OVERFLOW || st == SAVVY_ERR_INVALID_ARGUMENT);
+                                                 data_dummy, SIZE_MAX, out, sizeof(out), &written);
+        CHECK("001f data_len == SIZE_MAX (non-NULL data) rejected with SAVVY_ERR_OVERFLOW specifically",
+              st == SAVVY_ERR_OVERFLOW);
+
+#if SIZE_MAX > UINT32_MAX
+        {
+            size_t huge = (size_t)UINT32_MAX + 1;
+            st = savvy_packet_encode(1, 1, 1, 1, serial_dummy, SAVVY_PACKET_SERIAL_LEN,
+                                      data_dummy, huge, out, sizeof(out), &written);
+            CHECK("001f data_len == UINT32_MAX+1 (non-NULL data) rejected with SAVVY_ERR_OVERFLOW specifically",
+                  st == SAVVY_ERR_OVERFLOW);
+        }
+#endif
     }
 }
 

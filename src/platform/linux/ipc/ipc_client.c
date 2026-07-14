@@ -11,8 +11,18 @@
 savvy_status_t savvy_ipc_client_connect(const char *socket_path, uint32_t timeout_ms,
                                          savvy_ipc_transport_t *out_transport)
 {
+    return savvy_ipc_client_connect_cancelable(socket_path, timeout_ms, NULL, out_transport);
+}
+
+savvy_status_t savvy_ipc_client_connect_cancelable(const char *socket_path, uint32_t timeout_ms,
+                                                    const savvy_ipc_cancel_source_t *cancel,
+                                                    savvy_ipc_transport_t *out_transport)
+{
     if (socket_path == NULL || out_transport == NULL) {
         return SAVVY_ERR_INVALID_ARGUMENT;
+    }
+    if (savvy_ipc_cancel_source_is_cancelled(cancel)) {
+        return SAVVY_ERR_CANCELLED;
     }
 
     struct sockaddr_un addr;
@@ -43,10 +53,19 @@ savvy_status_t savvy_ipc_client_connect(const char *socket_path, uint32_t timeou
         }
 
         short revents = 0;
-        int pr = savvy_ipc_poll_with_deadline(fd, POLLOUT, timeout_ms, &revents);
+        int pr = savvy_ipc_poll_with_deadline_cancelable(fd, POLLOUT, timeout_ms, &revents, cancel);
         if (pr == 0) {
             close(fd);
             return SAVVY_ERR_TIMEOUT;
+        }
+        if (pr == 2) {
+            /* Cancelled while the connect was still in flight: this fd is
+             * ours alone (never handed to the caller), so a plain close()
+             * here is exactly right - there is no other thread that could
+             * be blocked on THIS fd, only the poll() above, which has
+             * already returned. */
+            close(fd);
+            return SAVVY_ERR_CANCELLED;
         }
         if (pr < 0 || (revents & (POLLERR | POLLHUP))) {
             close(fd);

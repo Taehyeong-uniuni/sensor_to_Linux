@@ -149,15 +149,70 @@ static void test_json_001(void)
               st == SAVVY_ERR_PROTOCOL);
     }
 
-    /* Invalid UTF-8 anywhere in the tree: rejected (F-10). Byte sequence
-     * is a valid 2-byte UTF-8 lead byte (0xC3) immediately followed by
-     * the JSON string's closing quote instead of a continuation byte. */
+    /* UTF-8 validation matrix (F-08/F-10) - savvy_utf8_validate's own doc
+     * comment claims it rejects truncated continuations, overlong
+     * encodings, surrogate-range codepoints, and out-of-Unicode-range
+     * codepoints; each was previously only checked via an ad-hoc scratch
+     * test outside the repo, not committed here - and a valid multibyte
+     * string must still be accepted (and preserved byte-for-byte), so a
+     * false-positive rejection would also show up. */
     {
+        /* Valid: "café" - é (U+00E9) is a well-formed 2-byte sequence
+         * (0xC3 0xA9). Must parse OK and round-trip byte-for-byte. */
+        savvy_config_t cfg;
+        savvy_config_set_defaults(&cfg);
+        const char *json = "{\"serverIp\":\"caf\xc3\xa9\"}";
+        savvy_status_t st = savvy_config_parse(json, strlen(json), &cfg, NULL);
+        CHECK("001 Config: valid multibyte UTF-8 (caf\xc3\xa9) accepted and preserved byte-for-byte",
+              st == SAVVY_OK && strcmp(cfg.server_ip, "caf\xc3\xa9") == 0);
+    }
+    {
+        /* Truncated: a valid 2-byte UTF-8 lead byte (0xC3) immediately
+         * followed by the JSON string's closing quote instead of a
+         * continuation byte. */
         savvy_config_t cfg;
         savvy_config_set_defaults(&cfg);
         const char *json = "{\"serverIp\":\"caf\xc3\"}";
         savvy_status_t st = savvy_config_parse(json, strlen(json), &cfg, NULL);
         CHECK("001 Config: truncated multibyte UTF-8 in string value rejected",
+              st == SAVVY_ERR_PROTOCOL);
+    }
+    {
+        /* Overlong: '/' (U+002F, canonically 1 byte: 0x2F) re-encoded as
+         * an unnecessary 2-byte sequence (0xC0 0xAF) - the classic
+         * overlong-slash test vector from UTF-8 security literature. Must
+         * be rejected even though both bytes are individually
+         * well-formed lead/continuation bytes. */
+        savvy_config_t cfg;
+        savvy_config_set_defaults(&cfg);
+        const char *json = "{\"serverIp\":\"x\xc0\xafx\"}";
+        savvy_status_t st = savvy_config_parse(json, strlen(json), &cfg, NULL);
+        CHECK("001 Config: overlong UTF-8 encoding (0xC0 0xAF) rejected",
+              st == SAVVY_ERR_PROTOCOL);
+    }
+    {
+        /* Surrogate: U+D800 (the first UTF-16 high surrogate) encoded as
+         * 0xED 0xA0 0x80 - structurally a well-formed 3-byte sequence,
+         * but RFC 3629 forbids the entire surrogate range U+D800-U+DFFF
+         * from ever appearing in UTF-8 (surrogates exist only for
+         * UTF-16's own encoding scheme). */
+        savvy_config_t cfg;
+        savvy_config_set_defaults(&cfg);
+        const char *json = "{\"serverIp\":\"x\xed\xa0\x80x\"}";
+        savvy_status_t st = savvy_config_parse(json, strlen(json), &cfg, NULL);
+        CHECK("001 Config: surrogate codepoint U+D800 (0xED 0xA0 0x80) rejected",
+              st == SAVVY_ERR_PROTOCOL);
+    }
+    {
+        /* Out-of-range: U+110000, one past the maximum valid Unicode
+         * codepoint (U+10FFFF), encoded as 0xF4 0x90 0x80 0x80 - a
+         * structurally well-formed 4-byte sequence that decodes beyond
+         * the range UTF-8 is permitted to represent. */
+        savvy_config_t cfg;
+        savvy_config_set_defaults(&cfg);
+        const char *json = "{\"serverIp\":\"x\xf4\x90\x80\x80x\"}";
+        savvy_status_t st = savvy_config_parse(json, strlen(json), &cfg, NULL);
+        CHECK("001 Config: out-of-range codepoint U+110000 (0xF4 0x90 0x80 0x80) rejected",
               st == SAVVY_ERR_PROTOCOL);
     }
 
