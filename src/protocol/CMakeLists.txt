@@ -1,6 +1,8 @@
 add_library(savvy_protocol STATIC
     packet/packet_codec.c
     packet/stream_parser.c
+    json/json_codec.c
+    ipc/ipc_envelope_codec.c
 )
 
 target_include_directories(savvy_protocol PUBLIC
