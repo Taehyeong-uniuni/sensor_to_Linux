@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -199,7 +200,8 @@ static void test_ipc_003(void)
         size_t truncated_len = strlen(truncated); /* no closing braces */
         send(server_peer_fd, truncated, truncated_len, 0);
         char rx[256]; size_t out_len = 0;
-        st = transport.recv(&transport, rx, sizeof(rx), &out_len);
+        st = transport.recv(&transport, rx, sizeof(rx) - 1, &out_len);
+        rx[out_len] = '\0'; /* savvy_ipc_envelope_parse requires text[len] == '\0' (see json_codec.h) */
         savvy_ipc_envelope_t env;
         savvy_status_t parse_st = savvy_ipc_envelope_parse(rx, out_len, &env);
         CHECK("003 truncated UTF-8 JSON explicitly rejected at parse (not crashed, not silently accepted)",

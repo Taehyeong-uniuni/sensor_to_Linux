@@ -1,3 +1,9 @@
+/* clock_gettime()/CLOCK_MONOTONIC are POSIX.1-2008; glibc hides them under
+ * -std=c11 without this (Apple's libc exposes them regardless, which is
+ * why this only surfaces when building on Linux). Must be defined before
+ * any system header is included. */
+#define _POSIX_C_SOURCE 200809L
+
 #include "savvy/core/clock.h"
 #include <time.h>
 
