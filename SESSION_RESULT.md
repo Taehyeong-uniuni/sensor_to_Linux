@@ -5,11 +5,11 @@
 - Branch: `foundation/contract-v1`
 - Base SHA: `f476aea1ce2674e1a1a791154b2e830cbb87940b` (pinned, gate-verified before branch creation)
 - **Pre-this-round HEAD** (item 1 of this round's 23-item checklist): `92142bd65ed68e8c4b4f42bd5733351565f7356e`
-- **Implementation SHA (item 2 - last code/contract/test commit, what was actually built and tested this round)**: `2a068ef205108edd4875f495253de261e0b76e1c`
-- **Report SHA**: not embedded here - this document's own commit necessarily lands *after* the Implementation SHA above, so a SHA claiming to be "this file's own commit" cannot appear inside that same commit's content (Codex V0A F-12; see "F-12 resolution" below for the full explanation). Run `git rev-parse HEAD` on `foundation/contract-v1` for the true current HEAD; it will be exactly one commit past the Implementation SHA above, and that one commit touches only this file.
+- **Implementation SHA (item 2 - last code/contract/test commit, what was actually built and tested this round)**: `2a068ef205108edd4875f495253de261e0b76e1c`, **superseded by a small follow-up touch-up commit `c9cd633`** (rewords this file's own status-disclaimer sentence, which had quoted the forbidden status phrases verbatim inside a negation, and aligns two CT-IPC-002 resync test payloads with V0R-H-01's now-corrected string types - found by the independent Opus verification pass below, both changes re-verified against the full 9/9 Docker suite afterward). `c9cd633` is the true final pre-report-commit HEAD; `2a068ef` remains what the "Findings addressed"/diff-stat sections below describe in detail.
+- **Report SHA**: not embedded here - this document's own commit necessarily lands *after* the Implementation SHA above, so a SHA claiming to be "this file's own commit" cannot appear inside that same commit's content (Codex V0A F-12; see "F-12 resolution" below for the full explanation). Run `git rev-parse HEAD` on `foundation/contract-v1` for the true current HEAD; it will be exactly one commit past `c9cd633` above, and that one commit touches only this file.
 - Counterpart repo (`mgr_to_Linux`) base SHA: `9ae8b92d327487a3e0bdf0588449744d66b78c4e`
 - Counterpart repo pre-this-round HEAD: `345242d1641950f9f4715714240396ef04063e14`
-- Counterpart repo Implementation SHA: `6e20fe8210edc3b6aba5bb01fcf69cbba308a109`
+- Counterpart repo Implementation SHA: `6e20fe8210edc3b6aba5bb01fcf69cbba308a109`, superseded the same way by `f732069`
 - Contract version: `1.0.0`
 - Status: `IMPLEMENTATION_FINISHED` / `AWAITING_CODEX_REVIEW` (this session does not claim the Foundation work is finalized, independently verified, or ready for downstream consumption - Codex re-verification and user testing are still outstanding)
 
@@ -89,6 +89,25 @@ commit that changes code/contracts/tests) and does not attempt to self-embed a
 "Report SHA" for its own commit. All stats in this document are `git rev-parse`/
 `git diff --stat`/`git log --oneline` output captured against the Implementation
 SHA, not hand-typed.
+
+## Independent final verification pass
+
+Before reporting this round complete, an independent reviewer (model: Opus, no
+prior context from this implementation work) was asked to adversarially re-check
+the diff against each finding's claim, allowed-paths compliance, Android-repo
+non-modification, tag/branch/merge absence, the actual Docker log evidence, and
+the forbidden-status-phrase constraint - not just re-read this document's prose.
+Result: every functional claim (A-F in its report) verified independently and
+passed. One real issue was found (G): this file's own status-disclaimer sentence
+quoted the forbidden phrases verbatim inside a negation ("does not declare
+X"), which a naive automated substring check could mistake for a violation
+despite the clearly-compliant intent; reworded (see the Status line above) so
+none of the literal forbidden strings appear anywhere in this document. A
+non-blocking style nit (H) was also fixed: two CT-IPC-002 resync payloads used
+bare JSON numbers for fields V0R-H-01 now defines as strings (harmless there,
+since that code path only tests delivery, not `savvy_ipc_action_validate_
+payload`, but confusing to read next to that fix). Both fixes were re-verified
+against the full 9/9 Docker suite before this document's own report commit.
 
 ## Findings addressed this round
 
