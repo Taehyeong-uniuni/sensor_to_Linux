@@ -1,5 +1,5 @@
 /*
- * CT-IPC-002~003 (session_tasks/CC-FOUNDATION.md "Required tests").
+ * CT-IPC-001~003 (session_tasks/CC-FOUNDATION.md "Required tests").
  * Real AF_UNIX SOCK_SEQPACKET transport - Docker Ubuntu 22.04 only
  * (macOS/Darwin does not support SOCK_SEQPACKET for AF_UNIX), built only
  * when SAVVY_IPC_REAL_TRANSPORT=ON.
@@ -12,12 +12,10 @@
  * mock/dummy, purely test harness scaffolding (00_SCOPE_LOCK.md 5.2
  * explicitly allows "unit test와 mock 추가").
  *
- * CT-IPC-001 (full Android action/key catalog conformance) is NOT in this
- * file yet - it is pending the Android source action-catalog research and
- * will be added once that is available; it is intentionally not
- * registered as a CTest test until then (no stub/fake pass).
+ * CT-IPC-001 uses the confirmed Android action catalog
+ * (contracts/ipc_action_catalog.md, from Android source research).
  *
- * Usage: test_ipc <002|003>
+ * Usage: test_ipc <001|002|003>
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -31,6 +29,7 @@
 #include <poll.h>
 #include "savvy/platform/ipc_client.h"
 #include "savvy/protocol/ipc_envelope.h"
+#include "savvy/protocol/ipc_action_catalog.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -67,6 +66,120 @@ static int raw_server_accept(int listen_fd, int timeout_ms)
     struct pollfd pfd = { .fd = listen_fd, .events = POLLIN, .revents = 0 };
     if (poll(&pfd, 1, timeout_ms) <= 0) return -1;
     return accept(listen_fd, NULL, NULL);
+}
+
+/* ---- CT-IPC-001: real Android action/key catalog conformance ---- */
+static void test_ipc_001(void)
+{
+    char path[108];
+    make_socket_path(path, sizeof(path));
+
+    int listen_fd = raw_server_listen(path);
+    savvy_ipc_transport_t transport;
+    savvy_status_t st = savvy_ipc_client_connect(path, &transport);
+    int server_peer_fd = raw_server_accept(listen_fd, 3000);
+    CHECK("001 setup: connected", st == SAVVY_OK && server_peer_fd >= 0);
+
+    /* Representative sample of the confirmed catalog (both directions),
+     * built via the envelope codec, sent over the real transport, and
+     * validated end to end (contracts/ipc_action_catalog.md). */
+    static const char *const SAMPLE[][2] = {
+        { "com.uniuni.savvysensor.config", "{\"jsonConfigDto\":{}}" },
+        { "com.uniuni.savvysensor.device", "{\"jsonDeviceDto\":{}}" },
+        { "com.uniuni.savvysensor.sensor.status.alert", "{\"AlertLedState\":1,\"AlertTime\":2,\"AlertSec\":3}" },
+        { "com.uniuni.savvymgr.ipc.connect", "{}" },
+        { "com.uniuni.savvymgr.getstate.sensor", "{\"SENSOR\":\"MIC\",\"STATE\":\"1\"}" },
+    };
+    int all_catalog_ok = 1;
+    for (size_t i = 0; i < sizeof(SAMPLE) / sizeof(SAMPLE[0]); i++) {
+        char *text = NULL; size_t len = 0;
+        if (savvy_ipc_envelope_build(SAMPLE[i][0], SAMPLE[i][1], &text, &len) != SAVVY_OK) {
+            all_catalog_ok = 0;
+            continue;
+        }
+        st = transport.send(&transport, text, len);
+        free(text);
+
+        char rx[4096];
+        ssize_t n = (st == SAVVY_OK) ? recv(server_peer_fd, rx, sizeof(rx) - 1, 0) : -1;
+        if (n <= 0) {
+            all_catalog_ok = 0;
+            continue;
+        }
+        rx[n] = '\0';
+
+        savvy_ipc_envelope_t env;
+        savvy_status_t pst = savvy_ipc_envelope_parse(rx, (size_t)n, &env);
+        if (pst != SAVVY_OK) {
+            all_catalog_ok = 0;
+            continue;
+        }
+
+        bool known = savvy_ipc_action_known(env.action);
+        savvy_status_t vst = savvy_ipc_action_validate_payload(env.action, env.payload_json);
+        if (!known || vst != SAVVY_OK || strcmp(env.action, SAMPLE[i][0]) != 0) {
+            all_catalog_ok = 0;
+        }
+        savvy_ipc_envelope_free(&env);
+    }
+    CHECK("001 sampled real-catalog actions round-trip and validate correctly", all_catalog_ok);
+
+    /* Payload type differs from spec: CONFIG action missing its one
+     * required payload key. */
+    {
+        char *text = NULL; size_t len = 0;
+        savvy_ipc_envelope_build("com.uniuni.savvysensor.config", "{}", &text, &len);
+        st = transport.send(&transport, text, len);
+        free(text);
+        char rx[512];
+        ssize_t n = (st == SAVVY_OK) ? recv(server_peer_fd, rx, sizeof(rx) - 1, 0) : -1;
+        int ok = 0;
+        if (n > 0) {
+            rx[n] = '\0';
+            savvy_ipc_envelope_t env;
+            if (savvy_ipc_envelope_parse(rx, (size_t)n, &env) == SAVVY_OK) {
+                ok = (savvy_ipc_action_validate_payload(env.action, env.payload_json) == SAVVY_ERR_PROTOCOL);
+                savvy_ipc_envelope_free(&env);
+            }
+        }
+        CHECK("001 CONFIG action missing its required payload key is rejected by catalog validation", ok);
+    }
+
+    /* Missing "action" field entirely. */
+    {
+        const char *bad = "{\"payload\":{}}";
+        st = transport.send(&transport, bad, strlen(bad));
+        char rx[512];
+        ssize_t n = (st == SAVVY_OK) ? recv(server_peer_fd, rx, sizeof(rx) - 1, 0) : -1;
+        int ok = 0;
+        if (n > 0) {
+            rx[n] = '\0';
+            savvy_ipc_envelope_t env;
+            ok = (savvy_ipc_envelope_parse(rx, (size_t)n, &env) == SAVVY_ERR_PROTOCOL);
+        }
+        CHECK("001 missing action field rejected at envelope parse", ok);
+    }
+
+    /* Duplicate key inside a schema-controlled payload object. */
+    {
+        const char *bad = "{\"action\":\"com.uniuni.savvysensor.config\","
+                           "\"payload\":{\"jsonConfigDto\":{},\"jsonConfigDto\":{}}}";
+        st = transport.send(&transport, bad, strlen(bad));
+        char rx[512];
+        ssize_t n = (st == SAVVY_OK) ? recv(server_peer_fd, rx, sizeof(rx) - 1, 0) : -1;
+        int ok = 0;
+        if (n > 0) {
+            rx[n] = '\0';
+            savvy_ipc_envelope_t env;
+            ok = (savvy_ipc_envelope_parse(rx, (size_t)n, &env) == SAVVY_ERR_PROTOCOL);
+        }
+        CHECK("001 duplicate payload key rejected", ok);
+    }
+
+    close(server_peer_fd);
+    transport.close(&transport);
+    close(listen_fd);
+    unlink(path);
 }
 
 /* ---- CT-IPC-002: connect -> send/recv -> disconnect -> reconnect -> resync; pre-connect send drop ---- */
@@ -217,11 +330,13 @@ static void test_ipc_003(void)
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s <002|003>\n", argv[0]);
+        fprintf(stderr, "usage: %s <001|002|003>\n", argv[0]);
         return 2;
     }
 
-    if (strcmp(argv[1], "002") == 0) {
+    if (strcmp(argv[1], "001") == 0) {
+        test_ipc_001();
+    } else if (strcmp(argv[1], "002") == 0) {
         test_ipc_002();
     } else if (strcmp(argv[1], "003") == 0) {
         test_ipc_003();
