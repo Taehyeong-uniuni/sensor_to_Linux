@@ -1,6 +1,7 @@
 #ifndef SAVVY_PROTOCOL_DEVICE_CODEC_H
 #define SAVVY_PROTOCOL_DEVICE_CODEC_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "savvy/core/error.h"
 
@@ -46,13 +47,19 @@ typedef struct savvy_device {
  * sensor source). */
 void savvy_device_set_defaults(savvy_device_t *out);
 
-/* Parses `json` (NUL-terminated) into *out, which must already be
- * initialized (typically via savvy_device_set_defaults()). Missing keys
- * leave *out's existing value untouched. Rejects (SAVVY_ERR_PROTOCOL):
- * JSON null for any known field, wrong JSON type for any known field, a
- * string value too long for its fixed buffer, and any duplicate key
- * anywhere in the tree. Unknown extra keys are ignored. */
-savvy_status_t savvy_device_parse(const char *json, savvy_device_t *out);
+/* Parses `json` (`len` bytes, NUL-terminated at json[len]) into *out,
+ * which must already be initialized (typically via
+ * savvy_device_set_defaults()). Missing keys leave *out's existing value
+ * untouched. Rejects (SAVVY_ERR_PROTOCOL): JSON null for any known field,
+ * wrong JSON type for any known field, a fractional/non-finite/out-of-
+ * INT32-range number for an integer field, a string value too long for
+ * its fixed buffer, invalid UTF-8 anywhere in the tree, and any duplicate
+ * key anywhere in the tree. Unknown extra keys are ignored (per
+ * contracts/json_field_policy.md "unknown key: ignore + log"); if
+ * `unknown_key_log_fn` is non-NULL, it is invoked once per unknown key
+ * with ("jsonDeviceDto", key_name) - never the key's value. */
+savvy_status_t savvy_device_parse(const char *json, size_t len, savvy_device_t *out,
+                                   void (*unknown_key_log_fn)(const char *object_name, const char *key_name));
 
 /* Builds *dev into a newly malloc'd, NUL-terminated JSON string
  * (*out_json; caller frees with free()). */

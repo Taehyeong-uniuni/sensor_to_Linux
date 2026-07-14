@@ -40,7 +40,20 @@ savvy_status_t savvy_packet_encode(uint8_t start, uint8_t command, uint8_t devic
     if (out == NULL || out_written == NULL) {
         return SAVVY_ERR_INVALID_ARGUMENT;
     }
-    if (out_cap < (size_t)SAVVY_PACKET_HEADER_LEN + data_len) {
+    /* The wire Length field is exactly 32 bits - reject before the
+     * narrowing cast below could silently wrap. */
+    if (data_len > UINT32_MAX) {
+        return SAVVY_ERR_OVERFLOW;
+    }
+    /* Guard the header+data_len addition itself against size_t overflow
+     * before doing any arithmetic with it (a 32-bit build could otherwise
+     * wrap this sum and pass the capacity check below with a buffer far
+     * too small for the actual data_len). */
+    if (data_len > SIZE_MAX - (size_t)SAVVY_PACKET_HEADER_LEN) {
+        return SAVVY_ERR_OVERFLOW;
+    }
+    size_t total = (size_t)SAVVY_PACKET_HEADER_LEN + data_len; /* now safe: overflow ruled out above */
+    if (out_cap < total) {
         return SAVVY_ERR_OVERFLOW;
     }
 
@@ -49,7 +62,7 @@ savvy_status_t savvy_packet_encode(uint8_t start, uint8_t command, uint8_t devic
     out[2] = device;
     out[3] = config;
 
-    uint32_t length = (uint32_t)data_len;
+    uint32_t length = (uint32_t)data_len; /* safe: data_len <= UINT32_MAX checked above */
     out[4] = (uint8_t)((length >> 24) & 0xFFu);
     out[5] = (uint8_t)((length >> 16) & 0xFFu);
     out[6] = (uint8_t)((length >> 8) & 0xFFu);
@@ -67,7 +80,7 @@ savvy_status_t savvy_packet_encode(uint8_t start, uint8_t command, uint8_t devic
         memcpy(out + SAVVY_PACKET_HEADER_LEN, data, data_len);
     }
 
-    *out_written = (size_t)SAVVY_PACKET_HEADER_LEN + data_len;
+    *out_written = total;
     return SAVVY_OK;
 }
 

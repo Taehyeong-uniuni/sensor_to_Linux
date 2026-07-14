@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include "savvy/protocol/packet_codec.h"
 #include "savvy/protocol/stream_parser.h"
 
@@ -125,6 +126,63 @@ static void test_pkt_001(void)
         st = savvy_packet_decode(out, written, &hdr, &data, &data_len);
         CHECK("001d decode round-trip incl. embedded 0x00", st == SAVVY_OK && data_len == sizeof(body) &&
               memcmp(data, body, sizeof(body)) == 0);
+    }
+
+    /* Case E: length-boundary vectors. 255/256 straddle the Length
+     * field's low-byte rollover; 65536 straddles its low-16-bit rollover -
+     * both must round-trip with a correct big-endian Length field. */
+    {
+        size_t lengths[] = { 255, 256, 65536 };
+        for (size_t li = 0; li < sizeof(lengths) / sizeof(lengths[0]); li++) {
+            size_t n = lengths[li];
+            uint8_t *body = (uint8_t *)malloc(n);
+            for (size_t i = 0; i < n; i++) {
+                body[i] = (uint8_t)(i & 0xFF);
+            }
+            uint32_t crc = savvy_crc32(body, n);
+
+            size_t out_cap = SAVVY_PACKET_HEADER_LEN + n;
+            uint8_t *out = (uint8_t *)malloc(out_cap);
+            size_t written = 0;
+            savvy_status_t st = savvy_packet_encode(0x01, 0x02, 0x03, 0x04, SERIAL_A, SAVVY_PACKET_SERIAL_LEN,
+                                                     body, n, out, out_cap, &written);
+            char name[64];
+
+            snprintf(name, sizeof(name), "001e length=%zu encode OK", n);
+            CHECK(name, st == SAVVY_OK && written == out_cap);
+
+            uint32_t len32 = (uint32_t)n;
+            snprintf(name, sizeof(name), "001e length=%zu big-endian length bytes correct", n);
+            CHECK(name, out[4] == (uint8_t)(len32 >> 24) && out[5] == (uint8_t)(len32 >> 16) &&
+                        out[6] == (uint8_t)(len32 >> 8) && out[7] == (uint8_t)len32);
+
+            snprintf(name, sizeof(name), "001e length=%zu CRC matches reference", n);
+            CHECK(name, out[22] == (uint8_t)(crc >> 24) && out[23] == (uint8_t)(crc >> 16) &&
+                        out[24] == (uint8_t)(crc >> 8) && out[25] == (uint8_t)crc);
+
+            savvy_packet_header_t hdr;
+            const uint8_t *data = NULL; size_t data_len = 0;
+            st = savvy_packet_decode(out, written, &hdr, &data, &data_len);
+            snprintf(name, sizeof(name), "001e length=%zu decode round-trip", n);
+            CHECK(name, st == SAVVY_OK && data_len == n && memcmp(data, body, n) == 0);
+
+            free(body);
+            free(out);
+        }
+    }
+
+    /* Case F: explicit overflow rejection at the encode API boundary
+     * (F-02/L-02) - a data_len that would overflow the header+data_len
+     * addition must be rejected, not silently truncate the wire Length
+     * field or wrap the capacity check. */
+    {
+        uint8_t serial_dummy[SAVVY_PACKET_SERIAL_LEN] = {0};
+        uint8_t out[64];
+        size_t written = 0;
+        savvy_status_t st = savvy_packet_encode(1, 1, 1, 1, serial_dummy, SAVVY_PACKET_SERIAL_LEN,
+                                                 NULL, SIZE_MAX, out, sizeof(out), &written);
+        CHECK("001f data_len == SIZE_MAX rejected (would overflow header+data_len)",
+              st == SAVVY_ERR_OVERFLOW || st == SAVVY_ERR_INVALID_ARGUMENT);
     }
 }
 

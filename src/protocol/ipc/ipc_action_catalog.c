@@ -4,26 +4,61 @@
 #include <string.h>
 #include <stddef.h>
 
+typedef enum catalog_value_type {
+    VT_OBJECT,
+    VT_STRING,
+    VT_NUMBER
+} catalog_value_type_t;
+
+typedef struct catalog_key {
+    const char *name; /* NULL terminates the array */
+    catalog_value_type_t type;
+    bool required;
+} catalog_key_t;
+
 typedef struct catalog_entry {
     const char *action;
     savvy_ipc_direction_t direction;
-    const char *const *payload_keys; /* NULL-terminated */
+    const catalog_key_t *payload_keys; /* terminated by {NULL, ...} */
 } catalog_entry_t;
 
-static const char *const NO_KEYS[] = { NULL };
-static const char *const CONFIG_KEYS[] = { "jsonConfigDto", NULL };
-static const char *const DEVICE_KEYS[] = { "jsonDeviceDto", NULL };
-static const char *const TEST_KEYS[] = { "TEST", NULL };
-static const char *const RESET_KEYS[] = { "RESET", NULL };
-static const char *const LEDPWR_KEYS[] = { "PwrLedState", NULL };
-static const char *const ALERT_KEYS[] = { "AlertLedState", "AlertTime", "AlertSec", NULL };
-static const char *const RKNN_RESULT_KEYS[] = { "rknnAnalResult", NULL };
-static const char *const GETSTATE_KEYS[] = { "SENSOR", "STATE", NULL };
-static const char *const IFCOMM_START_KEYS[] = { "IFCOMM_START", NULL };
-static const char *const UPLOAD_KEYS[] = { "targetFilePath", "targetFileNm", NULL };
-static const char *const DELAY_KEYS[] = { "DELAY_SEC", NULL };
-static const char *const TOF_PROP_KEYS[] = { "TofTemperature", "TofTemperDrv", "SmokeValue", "MicValue", NULL };
-static const char *const RSLT_KEYS[] = { "rslt", NULL };
+#define KEY_END { NULL, VT_OBJECT, false }
+
+static const catalog_key_t NO_KEYS[] = { KEY_END };
+static const catalog_key_t CONFIG_KEYS[] = { { "jsonConfigDto", VT_OBJECT, true }, KEY_END };
+static const catalog_key_t DEVICE_KEYS[] = { { "jsonDeviceDto", VT_OBJECT, true }, KEY_END };
+static const catalog_key_t TEST_KEYS[] = { { "TEST", VT_STRING, true }, KEY_END };
+static const catalog_key_t RESET_KEYS[] = { { "RESET", VT_STRING, true }, KEY_END };
+static const catalog_key_t LEDPWR_KEYS[] = { { "PwrLedState", VT_NUMBER, true }, KEY_END };
+static const catalog_key_t ALERT_KEYS[] = {
+    { "AlertLedState", VT_NUMBER, true },
+    { "AlertTime", VT_NUMBER, true },
+    { "AlertSec", VT_NUMBER, true },
+    KEY_END
+};
+static const catalog_key_t RKNN_RESULT_KEYS[] = { { "rknnAnalResult", VT_STRING, true }, KEY_END };
+static const catalog_key_t GETSTATE_KEYS[] = {
+    { "SENSOR", VT_STRING, true },
+    { "STATE", VT_NUMBER, true },
+    KEY_END
+};
+static const catalog_key_t IFCOMM_START_KEYS[] = { { "IFCOMM_START", VT_NUMBER, true }, KEY_END };
+static const catalog_key_t UPLOAD_KEYS[] = {
+    { "targetFilePath", VT_STRING, true },
+    { "targetFileNm", VT_STRING, true },
+    KEY_END
+};
+static const catalog_key_t DELAY_KEYS[] = { { "DELAY_SEC", VT_NUMBER, true }, KEY_END };
+static const catalog_key_t TOF_PROP_KEYS[] = {
+    /* Optional/nullable per contracts/ipc_action_catalog.md - present
+     * keys must still match the declared type. */
+    { "TofTemperature", VT_NUMBER, false },
+    { "TofTemperDrv", VT_NUMBER, false },
+    { "SmokeValue", VT_NUMBER, false },
+    { "MicValue", VT_NUMBER, false },
+    KEY_END
+};
+static const catalog_key_t RSLT_KEYS[] = { { "rslt", VT_STRING, true }, KEY_END };
 
 /* contracts/ipc_action_catalog.md §1-2. TEST_BROADCAST_1/2 and the
  * commented-out ACTION_BROADCAST_SEVERIP variant are deliberately
@@ -80,6 +115,19 @@ savvy_ipc_direction_t savvy_ipc_action_direction(const char *action)
     return (e != NULL) ? e->direction : SAVVY_IPC_MGR_TO_SENSOR;
 }
 
+static bool value_matches_type(const cJSON *item, catalog_value_type_t type)
+{
+    switch (type) {
+    case VT_OBJECT: return cJSON_IsObject(item);
+    case VT_STRING: return cJSON_IsString(item) && item->valuestring != NULL;
+    case VT_NUMBER: {
+        int32_t unused;
+        return savvy_json_number_to_int32(item, &unused) == SAVVY_OK;
+    }
+    default: return false;
+    }
+}
+
 savvy_status_t savvy_ipc_action_validate_payload(const char *action, const char *payload_json)
 {
     const catalog_entry_t *e = find_entry(action);
@@ -98,8 +146,16 @@ savvy_status_t savvy_ipc_action_validate_payload(const char *action, const char 
     }
 
     savvy_status_t result = SAVVY_OK;
-    for (const char *const *key = e->payload_keys; *key != NULL; key++) {
-        if (cJSON_GetObjectItemCaseSensitive(root, *key) == NULL) {
+    for (const catalog_key_t *key = e->payload_keys; key->name != NULL; key++) {
+        cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key->name);
+        if (item == NULL) {
+            if (key->required) {
+                result = SAVVY_ERR_PROTOCOL;
+                break;
+            }
+            continue;
+        }
+        if (!value_matches_type(item, key->type)) {
             result = SAVVY_ERR_PROTOCOL;
             break;
         }

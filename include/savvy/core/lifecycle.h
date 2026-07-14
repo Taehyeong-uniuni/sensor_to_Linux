@@ -22,7 +22,10 @@ typedef struct savvy_lifecycle {
     savvy_lifecycle_state_t state;
 } savvy_lifecycle_t;
 
-void savvy_lifecycle_init(savvy_lifecycle_t *lc);
+/* Returns SAVVY_ERR_UNKNOWN if the underlying mutex fails to initialize
+ * (platform/resource-exhaustion failure - practically never happens, but
+ * the caller must not treat *lc as usable if this returns non-OK). */
+savvy_status_t savvy_lifecycle_init(savvy_lifecycle_t *lc);
 
 /* Always returns SAVVY_OK; *out_transitioned (if non-NULL) reports whether
  * THIS call performed STOPPED->RUNNING (false when already RUNNING). */

@@ -1,6 +1,7 @@
 #ifndef SAVVY_PROTOCOL_DATA_RESULT_CODEC_H
 #define SAVVY_PROTOCOL_DATA_RESULT_CODEC_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "savvy/core/error.h"
@@ -16,7 +17,8 @@ typedef struct savvy_data_result {
     int32_t result;
 } savvy_data_result_t;
 
-/* Parses `json` (NUL-terminated) as {"result": <int>}.
+/* Parses `json` (`len` bytes, NUL-terminated at json[len]) as
+ * {"result": <int>}.
  *
  * Unlike config_codec/device_codec, a MISSING "result" key is a parse
  * error here (SAVVY_ERR_PROTOCOL) - not defaulted to 4. This is a
@@ -30,9 +32,11 @@ typedef struct savvy_data_result {
  * execution (see contracts/json_field_policy.md §4/§5), so this codec
  * rejects rather than guesses - matching CT-JSON-002's explicit spec.
  *
- * Also rejects: JSON null, non-integer type, duplicate key (both via
+ * Also rejects: JSON null, non-integer type, a fractional/non-finite/
+ * out-of-INT32-range number (e.g. {"result":4.9} must NOT silently
+ * truncate to 4), invalid UTF-8, duplicate key (both via
  * savvy_json_parse), and a non-object root. */
-savvy_status_t savvy_data_result_parse(const char *json, savvy_data_result_t *out);
+savvy_status_t savvy_data_result_parse(const char *json, size_t len, savvy_data_result_t *out);
 
 /* Builds {"result": dr->result} into a newly malloc'd, NUL-terminated
  * JSON string (*out_json; caller frees with free()). */

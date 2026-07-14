@@ -42,14 +42,15 @@ void savvy_device_set_defaults(savvy_device_t *out)
      * already yields exactly that (empty NUL-terminated strings, 0 ints). */
 }
 
-savvy_status_t savvy_device_parse(const char *json, savvy_device_t *out)
+savvy_status_t savvy_device_parse(const char *json, size_t len, savvy_device_t *out,
+                                   void (*unknown_key_log_fn)(const char *object_name, const char *key_name))
 {
     if (json == NULL || out == NULL) {
         return SAVVY_ERR_INVALID_ARGUMENT;
     }
 
     cJSON *root = NULL;
-    savvy_status_t st = savvy_json_parse(json, strlen(json), &root);
+    savvy_status_t st = savvy_json_parse(json, len, &root);
     if (st != SAVVY_OK) {
         return st;
     }
@@ -59,7 +60,7 @@ savvy_status_t savvy_device_parse(const char *json, savvy_device_t *out)
         return SAVVY_ERR_PROTOCOL;
     }
 
-    st = savvy_apply_field_table(root, DEVICE_FIELDS, N_DEVICE_FIELDS, out);
+    st = savvy_apply_field_table(root, DEVICE_FIELDS, N_DEVICE_FIELDS, out, "jsonDeviceDto", unknown_key_log_fn);
     cJSON_Delete(root);
     return st;
 }

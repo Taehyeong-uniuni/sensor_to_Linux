@@ -9,7 +9,10 @@
 
 savvy_time_t savvy_clock_now(void)
 {
-    struct timespec ts;
+    /* Zero-initialized so a (practically never happening) clock_gettime()
+     * failure yields a well-defined 0 reading instead of using
+     * uninitialized memory. */
+    struct timespec ts = {0, 0};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     savvy_time_t t;
     t.monotonic_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;

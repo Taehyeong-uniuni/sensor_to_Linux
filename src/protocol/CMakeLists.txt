@@ -15,3 +15,10 @@ target_include_directories(savvy_protocol PUBLIC
 )
 
 target_link_libraries(savvy_protocol PUBLIC savvy_core cjson)
+
+# json_codec.c's savvy_json_number_to_int32 calls floor()/isfinite(). glibc
+# ships these in a separate libm that must be linked explicitly; macOS folds
+# libm into libSystem, which is why this only fails to link on Linux.
+if(UNIX)
+    target_link_libraries(savvy_protocol PUBLIC m)
+endif()

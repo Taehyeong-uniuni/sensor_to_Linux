@@ -1,10 +1,13 @@
 #include "savvy/core/lifecycle.h"
 #include <stddef.h>
 
-void savvy_lifecycle_init(savvy_lifecycle_t *lc)
+savvy_status_t savvy_lifecycle_init(savvy_lifecycle_t *lc)
 {
-    pthread_mutex_init(&lc->lock, NULL);
+    if (pthread_mutex_init(&lc->lock, NULL) != 0) {
+        return SAVVY_ERR_UNKNOWN;
+    }
     lc->state = SAVVY_LIFECYCLE_STOPPED;
+    return SAVVY_OK;
 }
 
 savvy_status_t savvy_lifecycle_start(savvy_lifecycle_t *lc, bool *out_transitioned)

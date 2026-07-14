@@ -58,9 +58,9 @@ void savvy_config_set_defaults(savvy_config_t *out)
     out->milli_meter = 200;
     strcpy(out->sending_log_time, "03:00");
     out->keep_alive_time = 60000;
-    /* MGR-side default; Sensor-side Android default differs
-     * (13.125.173.114) - see contracts/json_field_policy.md §5 drift #1. */
-    strcpy(out->keep_server_ip, "15.165.113.212");
+    /* Sensor's own compiled Android default - see header comment for the
+     * confirmed drift vs. MGR's own compiled default. */
+    strcpy(out->keep_server_ip, "13.125.173.114");
     strcpy(out->boot_auto_time, "01:00");
     out->compress = 0;
     out->fracture_frame_pixel = 53760;
@@ -78,14 +78,15 @@ void savvy_config_set_defaults(savvy_config_t *out)
     out->buzzer_on_smoke = 1;
 }
 
-savvy_status_t savvy_config_parse(const char *json, savvy_config_t *out)
+savvy_status_t savvy_config_parse(const char *json, size_t len, savvy_config_t *out,
+                                   void (*unknown_key_log_fn)(const char *object_name, const char *key_name))
 {
     if (json == NULL || out == NULL) {
         return SAVVY_ERR_INVALID_ARGUMENT;
     }
 
     cJSON *root = NULL;
-    savvy_status_t st = savvy_json_parse(json, strlen(json), &root);
+    savvy_status_t st = savvy_json_parse(json, len, &root);
     if (st != SAVVY_OK) {
         return st;
     }
@@ -95,7 +96,7 @@ savvy_status_t savvy_config_parse(const char *json, savvy_config_t *out)
         return SAVVY_ERR_PROTOCOL;
     }
 
-    st = savvy_apply_field_table(root, CONFIG_FIELDS, N_CONFIG_FIELDS, out);
+    st = savvy_apply_field_table(root, CONFIG_FIELDS, N_CONFIG_FIELDS, out, "jsonConfigDto", unknown_key_log_fn);
     cJSON_Delete(root);
     return st;
 }

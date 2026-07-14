@@ -22,17 +22,28 @@ typedef struct savvy_field_desc {
     size_t str_cap;  /* buffer size, meaningful only for SAVVY_FIELD_STRING */
 } savvy_field_desc_t;
 
+/* Invoked once per JSON key present in the input with no corresponding
+ * field-table entry (ignored for forward-compatibility, per contracts/
+ * json_field_policy.md "unknown key: ignore + log"). Receives only
+ * `object_name` (e.g. "jsonConfigDto") and the unknown key's name - never
+ * its value, so logging can never capture potentially sensitive payload
+ * content. May be NULL to skip logging entirely. */
+typedef void (*savvy_unknown_key_log_fn)(const char *object_name, const char *key_name);
+
 /* Applies each present, non-null, correctly-typed key in `root` onto the
  * corresponding field of `out_struct` (already pre-populated with
  * defaults). Missing keys leave the existing value untouched (common
  * JSON field policy: "missing -> keep default"). Returns
  * SAVVY_ERR_PROTOCOL on: JSON null for a known field, wrong JSON type,
- * or a string longer than its field's str_cap-1 (rejected, not
- * truncated). Ignores unknown keys. Does NOT check for duplicate keys
- * itself - callers parse `root` via savvy_json_parse() first, which
- * already enforces that globally across the whole tree. */
+ * an integer field whose JSON number is fractional/non-finite/out of
+ * INT32 range, or a string longer than its field's str_cap-1 (rejected,
+ * not truncated). Ignores unknown keys (after invoking log_fn on each, if
+ * non-NULL). Does NOT check for duplicate keys itself - callers parse
+ * `root` via savvy_json_parse() first, which already enforces that
+ * globally across the whole tree. */
 savvy_status_t savvy_apply_field_table(const cJSON *root, const savvy_field_desc_t *fields,
-                                        size_t n_fields, void *out_struct);
+                                        size_t n_fields, void *out_struct,
+                                        const char *object_name, savvy_unknown_key_log_fn log_fn);
 
 /* Builds a new cJSON object with one entry per field, reading from
  * `in_struct`. Returns NULL on allocation failure (caller need not

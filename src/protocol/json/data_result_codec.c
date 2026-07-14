@@ -4,14 +4,14 @@
 #include <string.h>
 #include <stdlib.h>
 
-savvy_status_t savvy_data_result_parse(const char *json, savvy_data_result_t *out)
+savvy_status_t savvy_data_result_parse(const char *json, size_t len, savvy_data_result_t *out)
 {
     if (json == NULL || out == NULL) {
         return SAVVY_ERR_INVALID_ARGUMENT;
     }
 
     cJSON *root = NULL;
-    savvy_status_t st = savvy_json_parse(json, strlen(json), &root);
+    savvy_status_t st = savvy_json_parse(json, len, &root);
     if (st != SAVVY_OK) {
         return st;
     }
@@ -20,9 +20,12 @@ savvy_status_t savvy_data_result_parse(const char *json, savvy_data_result_t *ou
     if (cJSON_IsObject(root)) {
         cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "result");
         /* Missing "result" is deliberately a parse error here - see header. */
-        if (item != NULL && cJSON_IsNumber(item)) {
-            out->result = (int32_t)item->valuedouble;
-            result = SAVVY_OK;
+        if (item != NULL) {
+            int32_t v;
+            if (savvy_json_number_to_int32(item, &v) == SAVVY_OK) {
+                out->result = v;
+                result = SAVVY_OK;
+            }
         }
     }
 

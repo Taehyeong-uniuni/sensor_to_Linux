@@ -1,6 +1,7 @@
 #ifndef SAVVY_PROTOCOL_IPC_ACTION_CATALOG_H
 #define SAVVY_PROTOCOL_IPC_ACTION_CATALOG_H
 
+#include <stddef.h>
 #include <stdbool.h>
 #include "savvy/core/error.h"
 
@@ -24,16 +25,16 @@ bool savvy_ipc_action_known(const char *action);
  * savvy_ipc_action_known(action) is false - check that first. */
 savvy_ipc_direction_t savvy_ipc_action_direction(const char *action);
 
-/* Validates that `payload_json` (a JSON object's serialized text, e.g.
- * from a parsed savvy_ipc_envelope_t.payload_json) contains every
- * payload key the catalog requires for `action`. Returns
- * SAVVY_ERR_PROTOCOL if `action` is unknown/excluded, if `payload_json`
- * fails to parse or is not an object, or if any required key is absent.
- * Per-key JSON *type* conformance is not checked here - this repo's
- * envelope nests payload as JSON objects rather than Android's
- * double-string-encoding (contracts/json_field_policy.md §0), so
- * per-field typing belongs to the specific DTO codec (config_codec.h
- * etc.) or to the Wave 1 session owning that action. */
+/* Validates `payload_json` (a JSON object's serialized text, e.g. from a
+ * parsed savvy_ipc_envelope_t.payload_json) against the catalog entry for
+ * `action`: every required key must be present, and every key that IS
+ * present (required or optional) must have the catalog-declared JSON
+ * type (object/string/number) - e.g. CONFIG's {"jsonConfigDto":"not-an-
+ * object"} is rejected even though the key exists, because the catalog
+ * declares jsonConfigDto as an object. Returns SAVVY_ERR_PROTOCOL if
+ * `action` is unknown/excluded, if `payload_json` fails to parse or is
+ * not an object, if a required key is absent, or if any present key's
+ * type mismatches. */
 savvy_status_t savvy_ipc_action_validate_payload(const char *action, const char *payload_json);
 
 #ifdef __cplusplus

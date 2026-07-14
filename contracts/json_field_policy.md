@@ -186,13 +186,15 @@ spec already called for.
    `13.125.173.114`. Both are independently-duplicated POJOs (no shared
    library dependency in either `build.gradle`), so this is plausibly an
    unintentional drift between the two codebases rather than a deliberate
-   difference. `savvy_config_set_defaults()` in this codebase uses the
-   MGR-side value (`15.165.113.212`) as *the* Foundation default, since
-   MGR's `JsonConfigDto` is authoritative for this session's Config
-   contract; this does not resolve which value is "correct" for
-   production - that decision belongs to whoever owns
-   `08_BLOCKERS.md`/`SCOPE_CHANGE_REQUEST`, not to this Foundation
-   session.
+   difference. `savvy_config_set_defaults()` matches **each repo's own
+   app**: `mgr_to_Linux`'s `savvy_config_set_defaults()` returns
+   `15.165.113.212` (MGR's own compiled default) and
+   `sensor_to_Linux`'s returns `13.125.173.114` (Sensor's own compiled
+   default) - a deliberate, documented per-repo divergence, not a shared
+   Foundation-wide default and not a bug. This does not resolve which
+   value is "correct" for production if the two apps are ever meant to
+   agree - that decision belongs to whoever owns `08_BLOCKERS.md`/
+   `SCOPE_CHANGE_REQUEST`, not to this Foundation session.
 2. **`DataResult` Gson-unsafe-allocation risk** (§4) - not independently
    verified by executing real Gson 2.8.2 bytecode; recommend the porting
    team confirm empirically (e.g. on a device/emulator) before relying on
