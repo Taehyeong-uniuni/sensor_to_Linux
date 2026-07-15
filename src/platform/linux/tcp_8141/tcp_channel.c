@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "sensor_platform/tcp_channel.h"
 
 #include <stdio.h>

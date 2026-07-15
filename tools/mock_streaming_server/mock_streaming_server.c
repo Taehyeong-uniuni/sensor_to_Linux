@@ -24,6 +24,8 @@
  * caller that requested an ephemeral port (the default, --port=0) can
  * discover which one was assigned.
  */
+#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

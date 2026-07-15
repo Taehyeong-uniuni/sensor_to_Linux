@@ -8,6 +8,8 @@
  * get a Command='R' response with an unquoted-key `{result:N}` body
  * (the real server's actual, non-strict-JSON wire format); PIROUT gets
  * no response at all, just a connection close. */
+#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

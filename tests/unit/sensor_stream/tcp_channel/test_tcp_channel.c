@@ -4,6 +4,8 @@
  * (a timed-out request's late response is never consumed as the next
  * request's response, because a timeout closes the session and the next
  * request lazily reconnects on a fresh socket + fresh parser buffer). */
+#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
