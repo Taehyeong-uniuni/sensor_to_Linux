@@ -33,9 +33,11 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/wait.h>
+#include <errno.h>
 #include "savvy/platform/ipc_client.h"
 #include "savvy/platform/ipc_reconnect.h"
 #include "savvy/platform/ipc_cancel.h"
+#include "savvy/platform/ipc_test_hooks.h"
 #include "savvy/protocol/ipc_envelope.h"
 #include "savvy/protocol/ipc_action_catalog.h"
 
@@ -733,6 +735,62 @@ static void *signal_bomber_thread(void *arg)
     return NULL;
 }
 
+/* TC-H-01: deterministic fault injection (savvy_test_poll_override, from
+ * ipc_test_hooks.h) for the poll()/EINTR/absolute-deadline interaction -
+ * real external signals cannot reliably land inside a single
+ * poll(..., 0) call's sub-microsecond window, so these tests script
+ * poll()'s exact return sequence instead of racing real signal delivery
+ * (unlike 004C3's best-effort signal bombardment, which targets a
+ * different function - savvy_ipc_cancel_source_cancel()'s write() - and
+ * is explicitly documented there as non-deterministic). */
+typedef struct scripted_poll_state {
+    int call_count;
+    int eintr_calls;          /* how many leading calls return EINTR */
+    int sleep_ms_per_call;    /* sleep this long before each scripted EINTR return - lets a short deadline genuinely elapse in real wall-clock time */
+    int fall_through_to_real; /* after eintr_calls are exhausted, call the REAL poll() on the real fds/timeout passed in */
+} scripted_poll_state_t;
+
+static scripted_poll_state_t g_scripted;
+
+/* EINTR-safe: a bare single nanosleep() call can return early if any
+ * signal arrives during it (e.g. residual delivery from an earlier
+ * sub-test's signal bombardment) - loop using the remaining-time output
+ * parameter until the FULL requested duration has genuinely elapsed, so
+ * scripted_poll()'s timing guarantees (used to deterministically prove
+ * TC-H-01's deadline-vs-EINTR ordering) don't depend on no stray signal
+ * ever arriving during the test run. */
+static void sleep_ms_eintr_safe(int ms)
+{
+    struct timespec sl;
+    sl.tv_sec = ms / 1000;
+    sl.tv_nsec = (long)(ms % 1000) * 1000000L;
+    while (nanosleep(&sl, &sl) == -1 && errno == EINTR) {
+        /* sl was updated in place with the remaining time - keep going. */
+    }
+}
+
+static int scripted_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    g_scripted.call_count++;
+    if (g_scripted.call_count <= g_scripted.eintr_calls) {
+        if (g_scripted.sleep_ms_per_call > 0) {
+            sleep_ms_eintr_safe(g_scripted.sleep_ms_per_call);
+        }
+        errno = EINTR;
+        return -1;
+    }
+    if (g_scripted.fall_through_to_real) {
+        return poll(fds, nfds, timeout);
+    }
+    return 0;
+}
+
+static void reset_scripted_poll(void)
+{
+    memset(&g_scripted, 0, sizeof(g_scripted));
+    savvy_test_poll_override = NULL;
+}
+
 static void test_ipc_004(void)
 {
     /* A: a thread blocked in recv() wakes promptly when another thread
@@ -828,7 +886,15 @@ static void test_ipc_004(void)
      *       exercises the shared poll_with_deadline_cancelable's
      *       cancel-fd check without depending on any OS-specific blocking
      *       timing, and must return SAVVY_ERR_CANCELLED, quickly, every
-     *       time. */
+     *       time.
+     *
+     * TC-M-01: this C1 block is also, incidentally, already an example of
+     * the ONLY supported cancel/destroy lifecycle ordering documented in
+     * ipc_cancel.h: waiter starts -> cancel() (called synchronously here,
+     * so the "cancel-calling thread" IS the main thread, trivially
+     * already joined with itself by the time cancel() returns) -> waiter
+     * joins -> destroy(). Nothing here calls destroy() while cancel() or
+     * the waiter could still be in flight. */
     {
         char path[108];
         make_socket_path(path, sizeof(path));
@@ -869,6 +935,29 @@ static void test_ipc_004(void)
         occupying_transport.close(&occupying_transport);
         close(listen_fd);
         unlink(path);
+    }
+
+    /* TC-M-01: once destroy() has fully completed (sequentially - no
+     * concurrent user of the source, matching the documented
+     * precondition), a subsequent cancel() attempt must fail cleanly
+     * (SAVVY_ERR_INVALID_ARGUMENT), not crash or invoke undefined
+     * behavior - concurrent cancel/destroy racing is explicitly NOT
+     * supported (see ipc_cancel.h's concurrency contract), but destroy()
+     * THEN cancel(), strictly sequentially, is a fully defined case this
+     * API does handle. A second, sequential destroy() call afterward must
+     * also remain a safe no-op. */
+    {
+        savvy_ipc_cancel_source_t cancel;
+        savvy_status_t cs_st = savvy_ipc_cancel_source_init(&cancel);
+        CHECK("004C-lifecycle cancel source created", cs_st == SAVVY_OK);
+
+        savvy_ipc_cancel_source_destroy(&cancel);
+        savvy_status_t cancel_after_destroy_st = savvy_ipc_cancel_source_cancel(&cancel);
+        CHECK("004C-lifecycle cancel() after destroy() returns SAVVY_ERR_INVALID_ARGUMENT (no crash)",
+              cancel_after_destroy_st == SAVVY_ERR_INVALID_ARGUMENT);
+
+        savvy_ipc_cancel_source_destroy(&cancel); /* sequential double-destroy - reaching the line below without crashing/hanging IS the proof */
+        CHECK("004C-lifecycle sequential double-destroy is a safe no-op", 1);
     }
     {
         char path[108];
@@ -1234,6 +1323,141 @@ static void test_ipc_004(void)
         occupying_transport.close(&occupying_transport);
         close(listen_fd2);
         unlink(path2);
+    }
+
+    /* J (TC-H-01): deterministic poll()/EINTR/deadline fault injection.
+     * One real connected transport is reused across all sub-cases; each
+     * sub-case resets the scripted state (and the override itself)
+     * before and after. */
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        savvy_ipc_transport_t transport;
+        savvy_status_t st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &transport);
+        int server_peer_fd = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
+        CHECK("004J setup: connected", st == SAVVY_OK && server_peer_fd >= 0);
+
+        /* J1: timeout=0, fd already ready (data pre-sent) - the scripted
+         * poll falls straight through to the real poll(), only counting
+         * calls, so this proves "exactly one poll() call" on a genuinely
+         * ready descriptor. */
+        {
+            reset_scripted_poll();
+            g_scripted.fall_through_to_real = 1;
+            savvy_test_poll_override = scripted_poll;
+
+            const char *msg = "{\"action\":\"com.uniuni.savvymgr.fracture.sensor\",\"payload\":{}}";
+            size_t msg_len = strlen(msg);
+            ssize_t sent = send(server_peer_fd, msg, msg_len, 0);
+            struct timespec settle = { 0, 50000000L };
+            nanosleep(&settle, NULL);
+            char rx[256]; size_t out_len = 0;
+            st = transport.recv(&transport, rx, sizeof(rx), &out_len, 0);
+            CHECK("004J1 timeout=0 ready: exactly 1 poll() call, succeeds",
+                  sent == (ssize_t)msg_len && st == SAVVY_OK && g_scripted.call_count == 1);
+
+            reset_scripted_poll();
+        }
+
+        /* J2: timeout=0, nothing ready - same proof, for the not-ready
+         * outcome. */
+        {
+            reset_scripted_poll();
+            g_scripted.fall_through_to_real = 1;
+            savvy_test_poll_override = scripted_poll;
+
+            char rx[16]; size_t out_len = 0;
+            st = transport.recv(&transport, rx, sizeof(rx), &out_len, 0);
+            CHECK("004J2 timeout=0 not-ready: exactly 1 poll() call, times out",
+                  st == SAVVY_ERR_TIMEOUT && g_scripted.call_count == 1);
+
+            reset_scripted_poll();
+        }
+
+        /* J3: timeout>0 (5s, effectively never expires within this test),
+         * first poll() returns EINTR instantly (no sleep - the deadline
+         * has not remotely elapsed), second call falls through to the
+         * real poll() against a receive we prime just before calling -
+         * proves a pre-deadline EINTR is retried, not treated as fatal
+         * or as an immediate timeout. */
+        {
+            reset_scripted_poll();
+            g_scripted.eintr_calls = 1;
+            g_scripted.fall_through_to_real = 1;
+            savvy_test_poll_override = scripted_poll;
+
+            const char *msg = "{\"action\":\"com.uniuni.savvymgr.fracture.sensor\",\"payload\":{}}";
+            size_t msg_len = strlen(msg);
+            ssize_t sent = send(server_peer_fd, msg, msg_len, 0);
+            struct timespec settle = { 0, 50000000L };
+            nanosleep(&settle, NULL);
+            char rx[256]; size_t out_len = 0;
+            st = transport.recv(&transport, rx, sizeof(rx), &out_len, 5000u);
+            CHECK("004J3 timeout>0, EINTR before deadline: retried (2 poll() calls), succeeds",
+                  sent == (ssize_t)msg_len && st == SAVVY_OK && g_scripted.call_count == 2);
+
+            reset_scripted_poll();
+        }
+
+        /* J4: timeout=10ms, the one scripted poll() call sleeps 50ms
+         * (genuinely exceeding the 10ms deadline in real wall-clock time)
+         * before returning EINTR. TC-H-01's fix must recognize, on the
+         * loop iteration immediately after, that the absolute deadline
+         * has already elapsed and return SAVVY_ERR_TIMEOUT WITHOUT
+         * issuing a second poll() call - proving the bug (an
+         * unconditional retry-on-EINTR that ignored an already-expired
+         * deadline) is fixed. */
+        {
+            reset_scripted_poll();
+            g_scripted.eintr_calls = 1;
+            g_scripted.sleep_ms_per_call = 50;
+            g_scripted.fall_through_to_real = 0; /* must never be reached if the fix is correct */
+            savvy_test_poll_override = scripted_poll;
+
+            char rx[16]; size_t out_len = 0;
+            uint64_t before = wall_ms();
+            st = transport.recv(&transport, rx, sizeof(rx), &out_len, 10u);
+            uint64_t elapsed = wall_ms() - before;
+            CHECK("004J4 timeout>0, EINTR strictly after deadline: exactly 1 poll() call, "
+                  "immediate SAVVY_ERR_TIMEOUT (not a second retry)",
+                  st == SAVVY_ERR_TIMEOUT && g_scripted.call_count == 1 && elapsed < 500);
+
+            reset_scripted_poll();
+        }
+
+        /* J5/J6: sustained EINTR - 30 scripted EINTR calls are available
+         * (sleep_ms_per_call=5 each), but the deadline is only 50ms, so
+         * TC-H-01's fix must stop retrying once the deadline elapses
+         * (~10 calls in) rather than exhausting all 30 - proving both
+         * that the poll() call count is bounded (not unbounded/busy-
+         * looping) and that the total wait does not meaningfully exceed
+         * the requested timeout. */
+        {
+            reset_scripted_poll();
+            g_scripted.eintr_calls = 30;
+            g_scripted.sleep_ms_per_call = 5;
+            g_scripted.fall_through_to_real = 0;
+            savvy_test_poll_override = scripted_poll;
+
+            char rx[16]; size_t out_len = 0;
+            uint64_t before = wall_ms();
+            st = transport.recv(&transport, rx, sizeof(rx), &out_len, 50u);
+            uint64_t elapsed = wall_ms() - before;
+            CHECK("004J5 sustained EINTR: poll() call count bounded well below the 30 scripted "
+                  "(stopped once the deadline elapsed, not because EINTRs ran out)",
+                  g_scripted.call_count > 0 && g_scripted.call_count < 30);
+            CHECK("004J6 sustained EINTR: total wait does not meaningfully exceed the 50ms "
+                  "requested timeout, and reports SAVVY_ERR_TIMEOUT",
+                  st == SAVVY_ERR_TIMEOUT && elapsed < 500);
+
+            reset_scripted_poll();
+        }
+
+        close(server_peer_fd);
+        transport.close(&transport);
+        close(listen_fd);
+        unlink(path);
     }
 }
 

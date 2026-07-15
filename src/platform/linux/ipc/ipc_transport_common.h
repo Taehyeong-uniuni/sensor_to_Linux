@@ -37,7 +37,16 @@ int savvy_ipc_poll_with_deadline(int fd, short events, uint32_t timeout_ms, shor
  * becoming ready in the same instant. `cancel` may be NULL to disable
  * this (identical behavior to savvy_ipc_poll_with_deadline). Returns: 1 =
  * `fd` ready (same *out_revents semantics as above), 0 = deadline
- * expired, -1 = poll() failure (errno set), 2 = cancelled. */
+ * expired, -1 = poll() failure (errno set), 2 = cancelled.
+ *
+ * TC-H-01: the very first poll() of a given call ALWAYS happens,
+ * regardless of timeout_ms (this is what makes timeout_ms == 0 a genuine
+ * one-time readiness check per FINAL-M-01, rather than an automatic
+ * timeout). Every poll() AFTER that first one - i.e. every EINTR retry -
+ * first checks whether the absolute deadline has already elapsed and, if
+ * so, returns 0 immediately instead of polling again; this bounds a
+ * sustained EINTR storm to roughly one extra poll() call past the
+ * deadline; it does not restart or extend the wait. */
 int savvy_ipc_poll_with_deadline_cancelable(int fd, short events, uint32_t timeout_ms,
                                              short *out_revents,
                                              const savvy_ipc_cancel_source_t *cancel);

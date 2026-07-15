@@ -1,6 +1,7 @@
 #include "ipc_transport_common.h"
 #include "savvy/protocol/ipc_envelope.h" /* SAVVY_IPC_MAX_MESSAGE */
 #include "savvy/core/clock.h"
+#include "savvy/platform/ipc_test_hooks.h"
 #include <sys/socket.h>
 #include <unistd.h>
 #include <string.h>
@@ -9,6 +10,18 @@
 #include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
+
+/* TC-H-01: NULL in every non-test build and whenever no test has an
+ * override installed - see ipc_test_hooks.h. */
+savvy_poll_fn_t savvy_test_poll_override = NULL;
+
+static int savvy_do_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    if (savvy_test_poll_override != NULL) {
+        return savvy_test_poll_override(fds, nfds, timeout);
+    }
+    return poll(fds, nfds, timeout);
+}
 
 savvy_status_t savvy_ipc_cancel_source_init(savvy_ipc_cancel_source_t *cs)
 {
@@ -110,21 +123,38 @@ int savvy_ipc_poll_with_deadline_cancelable(int fd, short events, uint32_t timeo
 {
     savvy_deadline_t deadline;
     savvy_deadline_arm(&deadline, timeout_ms);
+    /* TC-H-01: tracks whether the very first poll() of this call has
+     * happened yet. The absolute-deadline-expired check right below is
+     * skipped ONLY for that first poll (see the comment there for why),
+     * and applied on every iteration after it - including ones reached
+     * via an EINTR retry. */
+    bool first_poll_done = false;
 
     for (;;) {
-        /* FINAL-M-01: no pre-check against savvy_deadline_expired() here.
-         * For timeout_ms == 0, the public contract is "perform exactly one
-         * non-blocking readiness check" - but savvy_deadline_expired()
-         * treats a 0ms deadline as expired from the very first instant
-         * (elapsed >= 0 is always true), which used to make this function
-         * return SAVVY_ERR_TIMEOUT unconditionally, even when the fd was
-         * already ready, without ever calling poll() at all. Removing the
-         * pre-check does not change timeout_ms > 0 behavior at all: with
-         * `remaining` computed below and passed straight to poll(), an
-         * already-elapsed deadline still correctly results in
-         * poll(..., 0) - a real, immediate, non-blocking check - which
-         * poll() itself resolves to "not ready" (pr == 0, handled below)
-         * exactly as before. */
+        if (first_poll_done && savvy_deadline_expired(&deadline)) {
+            /* Not the first poll of this call, and the absolute deadline
+             * has already elapsed - stop immediately rather than issuing
+             * another poll(). Without this, a sustained EINTR storm
+             * arriving after the deadline had already passed could keep
+             * this loop retrying indefinitely (each EINTR recomputes a
+             * `remaining` of 0 and calls poll(..., 0) again, which can
+             * itself be interrupted by yet another signal before ever
+             * resolving to "not ready") - TC-H-01, a regression
+             * introduced by FINAL-M-01's fix below. */
+            return 0;
+        }
+
+        /* FINAL-M-01 (first poll only): the public contract for
+         * timeout_ms == 0 is "perform exactly one non-blocking readiness
+         * check" - savvy_deadline_expired() treats a 0ms deadline as
+         * expired from the very first instant (elapsed >= 0 is always
+         * true), so unconditionally checking it before every poll would
+         * make timeout_ms == 0 always report SAVVY_ERR_TIMEOUT without
+         * ever calling poll(), even when the fd was already ready. The
+         * `first_poll_done` guard above exempts only the FIRST poll from
+         * that check, so timeout_ms == 0 still gets its one guaranteed
+         * readiness check, while TC-H-01's fix above still applies to
+         * every retry after it. */
         uint32_t remaining = savvy_deadline_remaining_ms(&deadline);
         int clamped = (remaining > (uint32_t)INT_MAX) ? INT_MAX : (int)remaining;
 
@@ -140,12 +170,17 @@ int savvy_ipc_poll_with_deadline_cancelable(int fd, short events, uint32_t timeo
             nfds = 2;
         }
 
-        int pr = poll(pfds, nfds, clamped);
+        int pr = savvy_do_poll(pfds, nfds, clamped);
+        first_poll_done = true;
+
         if (pr < 0) {
             if (errno == EINTR) {
                 /* Recompute the remaining time from the ORIGINAL absolute
                  * deadline on the next loop iteration - never restart a
-                 * fresh `timeout_ms`-length wait (V0B-H-02). */
+                 * fresh `timeout_ms`-length wait (V0B-H-02) - and, per
+                 * TC-H-01 above, stop entirely instead of retrying again
+                 * if that recomputation shows the deadline already
+                 * elapsed. */
                 continue;
             }
             return -1;
