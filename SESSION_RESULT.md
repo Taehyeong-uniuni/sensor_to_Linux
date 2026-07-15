@@ -1,21 +1,89 @@
 # SESSION_RESULT
 
-- SESSION_ID: `CC-FOUNDATION` (this document covers the initial Foundation implementation and two subsequent Codex fix rounds, all on the same branch)
+- SESSION_ID: `CC-FOUNDATION` (this document covers the initial Foundation implementation and three subsequent Codex fix rounds, all on the same branch)
 - Repository: `sensor_to_Linux`
 - Branch: `foundation/contract-v1`
 - Base SHA: `f476aea1ce2674e1a1a791154b2e830cbb87940b` (pinned, gate-verified before branch creation)
-- **Pre-this-round HEAD** (item 1 of this round's 23-item checklist): `92142bd65ed68e8c4b4f42bd5733351565f7356e`
-- **Implementation SHA (item 2 - last code/contract/test commit, what was actually built and tested this round)**: `2a068ef205108edd4875f495253de261e0b76e1c`, **superseded by a small follow-up touch-up commit `c9cd633`** (rewords this file's own status-disclaimer sentence, which had quoted the forbidden status phrases verbatim inside a negation, and aligns two CT-IPC-002 resync test payloads with V0R-H-01's now-corrected string types - found by the independent Opus verification pass below, both changes re-verified against the full 9/9 Docker suite afterward). `c9cd633` is the true final pre-report-commit HEAD; `2a068ef` remains what the "Findings addressed"/diff-stat sections below describe in detail.
-- **Report SHA**: not embedded here - this document's own commit necessarily lands *after* the Implementation SHA above, so a SHA claiming to be "this file's own commit" cannot appear inside that same commit's content (Codex V0A F-12; see "F-12 resolution" below for the full explanation). Run `git rev-parse HEAD` on `foundation/contract-v1` for the true current HEAD; it will be exactly one commit past `c9cd633` above, and that one commit touches only this file.
+- **Pre-this-round HEAD**: `fc0aa62a585d123a7b0169df959c8935df29d05b` (final HEAD of the prior V0R-H-01/F-07/V0B-H-02/F-08 round)
+- **Implementation SHA (this round - FINAL-M-01/FINAL-M-02 - last code/test commit, what was actually built and tested)**: `941545fc2955f1ad5822d20f4a2e226b5251568a`
+- **Report SHA**: not embedded here - this document's own commit necessarily lands *after* the Implementation SHA above, so a SHA claiming to be "this file's own commit" cannot appear inside that same commit's content (Codex V0A F-12; see "F-12 resolution" below for the full explanation). Run `git rev-parse HEAD` on `foundation/contract-v1` for the true current HEAD; it will be exactly one commit past the Implementation SHA above, and that one commit touches only this file (FINAL-L-01's report-only changes).
 - Counterpart repo (`mgr_to_Linux`) base SHA: `9ae8b92d327487a3e0bdf0588449744d66b78c4e`
-- Counterpart repo pre-this-round HEAD: `345242d1641950f9f4715714240396ef04063e14`
-- Counterpart repo Implementation SHA: `6e20fe8210edc3b6aba5bb01fcf69cbba308a109`, superseded the same way by `f732069`
+- Counterpart repo pre-this-round HEAD: `cd13f388d9c57da565d928df88bc0eb7841ae2f7`
+- Counterpart repo Implementation SHA (this round): `d671ed7230533b07230b568ca47842b3efe50e71`
 - Contract version: `1.0.0`
 - Status: `IMPLEMENTATION_FINISHED` / `AWAITING_CODEX_REVIEW` (this session does not claim the Foundation work is finalized, independently verified, or ready for downstream consumption - Codex re-verification and user testing are still outstanding)
 
-## Codex re-verification round - 23-item checklist
+## FINAL-M-01 / FINAL-M-02 / FINAL-L-01 fix round (current)
 
-This section is the authoritative index for this round's required items; later sections give full detail and are cross-referenced by number.
+A final Codex re-verification found two remaining production bugs and asked for
+one report-only cleanup, on top of the V0R-H-01/F-07/V0B-H-02/F-08 round
+documented in the (now historical, but still accurate) 23-item checklist
+section below.
+
+- **FINAL-M-01 (timeout_ms == 0 semantics)**: the public IPC timeout contract
+  says `timeout_ms == 0` means "don't block, but check readiness exactly once."
+  `savvy_ipc_poll_with_deadline_cancelable()` had a redundant pre-check
+  (`if (savvy_deadline_expired(&deadline)) return 0;`) at the top of its loop,
+  before poll() was ever called. `savvy_deadline_expired()` treats a 0ms
+  deadline as expired from the very first instant (elapsed `>= 0` is always
+  true), so this made `timeout_ms == 0` always report `SAVVY_ERR_TIMEOUT`
+  regardless of actual readiness - an already-ready descriptor never got a
+  chance to be observed. **Fix**: removed the pre-check entirely. This has zero
+  effect on `timeout_ms > 0` behavior (an already-elapsed deadline there still
+  resolves correctly via `poll(..., 0)` a few lines later, exactly as before -
+  the check was purely redundant, and only broke the 0ms edge case). No busy
+  loop is introduced; each call is still exactly one bounded `poll()`.
+  **Verified**: a full ready/not-ready matrix across recv (H1/H2), send
+  (H3/H4), and this repo's own connect role (H5/H6, including an honest
+  documented note about the same backlog-exhaustion-doesn't-reliably-block
+  environment quirk already found in the prior round's 004C1) - all 6 passing
+  on Docker Linux, confirmed by running `test_ipc 004` standalone (not just via
+  `ctest`, which only shows output for failing tests): 36/36 checks passed.
+- **FINAL-M-02 (cancel self-pipe EINTR handling)**: `savvy_ipc_cancel_source_
+  cancel()` called `write()` exactly once and discarded the result - an
+  `EINTR` (byte never actually written) was silently treated as success,
+  which could leave a blocked waiter with no way to know cancellation was ever
+  requested. **Fix**: `savvy_ipc_cancel_source_cancel()` now returns
+  `savvy_status_t` (was `void`): retries on `EINTR` (bounded to 16 attempts -
+  never an unbounded/busy loop) until the byte is genuinely written; treats
+  `EAGAIN`/`EWOULDBLOCK` (a byte from an earlier call is already pending) as
+  success, not failure; propagates any other `errno` as `SAVVY_ERR_IO`. A
+  caller that receives `SAVVY_OK` is now guaranteed the cancel byte is
+  pending, so any waiter will wake promptly. This is a signature change to one
+  function with no prior external callers besides this session's own tests
+  (updated to check the new return value) - not a large-scale redesign of
+  anything already resolved. **Verified**: a dedicated thread hammers `SIGUSR2`
+  (handler installed *without* `SA_RESTART`, so delivered signals are
+  guaranteed to actually interrupt a syscall) at the exact thread calling
+  `cancel()`, for the full duration of that call. This cannot *guarantee*
+  `EINTR` actually lands inside a single 1-byte pipe `write()`'s real syscall
+  window on every run (such writes are normally sub-microsecond, faster than
+  external signal delivery can reliably race against) - documented as an
+  honest limitation, not overclaimed - but it does confirm the end-to-end
+  outcome (`cancel()` returns `SAVVY_OK`, the waiter's connect attempt
+  concludes definitively) holds under sustained concurrent signal pressure
+  regardless of whether this specific run happened to hit the `EINTR` branch.
+- **FINAL-L-01 (SESSION_RESULT report-only cleanup)**: see "Android baseline
+  integrity" (reframed as NOT a Foundation code blocker), "Approved:
+  keepServerIp divergence" (reframed as an approved, closed design decision,
+  not an open `SCOPE_CHANGE_REQUEST`), and "Pre-tag compatibility evidence"
+  (the `DataResult` Gson item, kept open and explicitly NOT recorded as
+  resolved, tracked separately from "Blockers") below - all report-only, no
+  code or test behavior changed by this item.
+
+**This round's build/test verification**: macOS 5/5 (unchanged in substance -
+`test_ipc` isn't built there); Docker Linux 9/9 on both repos via the official
+`run-foundation-tests.sh` against the official image, **plus** direct
+standalone execution of `test_ipc 004` in a throwaway container (bypassing
+`ctest`'s output-on-failure-only capture) to visually confirm every individual
+new `CHECK` - 30/30 (mgr) and 36/36 (sensor) - see "macOS host build/test" and
+"Docker Linux build/test" below for full detail.
+
+## Codex re-verification round - 23-item checklist (prior round, historical)
+
+This section is the authoritative index for the **prior** (V0R-H-01/F-07/
+V0B-H-02/F-08) round's required items - kept here unmodified for that round's
+own record; later sections give full detail and are cross-referenced by number.
 
 1. **Pre-this-round HEAD**: `92142bd65ed68e8c4b4f42bd5733351565f7356e` (see header block above).
 2. **Final implementation commit SHA**: `2a068ef205108edd4875f495253de261e0b76e1c` (see header block above; the SESSION_RESULT report commit lands one commit after this, per the F-12 resolution).
@@ -38,10 +106,23 @@ This section is the authoritative index for this round's required items; later s
 19. **Android repository not modified check**: both `savvy_mgr` and `savvy_sensor` HEADs remain exactly the pinned SHAs; this session issued no write commands against either repo this round (only `git show`/`git status`/`stat` read-only checks, per the read-only research method in item 5). The pre-existing, still-unresolved working-tree drift reported in the prior round is unchanged - see the dedicated integrity section below.
 20. **No new feature added check**: confirmed - all four findings are Foundation-layer fixes (catalog type correctness, a minimal hook interface, transport cancellation, test-vector correctness), not Wave 1 feature work; `src/features/**`, `src/app/**` remain untouched; no Wi-Fi/BT/BLE/TCP-8140/TCP-8141/ToF/RKNN/GPIO/watchdog/thermal/OTA code was added.
 21. **Hardware QA not performed check**: confirmed - no board/hardware interaction this round; verification is macOS host + Docker Linux (`linux/arm64` container) only, exactly as scoped.
-22. **Remaining blockers**: see "Blockers and incomplete items" below - unchanged from the prior round (Android baseline integrity, `keepServerIp` production-value decision, `DataResult` Gson-risk empirical verification, RV1106 cross-build, `SO_PEERCRED`/production socket path, placeholder contract files, no `CONTRACT_CHANGE_REQUEST` filed) plus one new informational item (the Docker Image ID mismatch in item 8).
+22. **Remaining blockers**: see "Blockers and incomplete items" below (RV1106 cross-build, `SO_PEERCRED`/production socket path, placeholder contract files, no `CONTRACT_CHANGE_REQUEST` filed, the Docker Image ID mismatch) - per FINAL-L-01, Android baseline integrity and `keepServerIp` are explicitly NOT blockers (see their own dedicated sections), and `DataResult` Gson-risk is open but tracked separately as pre-tag compatibility evidence, not a blocker.
 23. **Tag not created check**: confirmed - `contract-v1` was not created this round (or any prior round); no new branch, merge, rebase, or push was performed either.
 
-## ⚠ Android baseline integrity - URGENT, not fixed, read this first
+## ⚠ Android baseline integrity - separate audit item, NOT a Foundation code blocker
+
+**FINAL-L-01 clarification**: this is a real, unresolved integrity concern about
+the two read-only Android reference repos' *working trees* (see below), but it is
+**not a blocker on this Foundation code** and does not appear in "Blockers and
+incomplete items" below. Every Android-source citation this session has ever
+made - this round's V0R-H-01 re-verification included - was read via `git show
+<pinned-sha>:<path>` against the pinned commit *objects*, never the working
+tree; Foundation's implementation provenance has never depended on, and is
+unaffected by, whatever is currently sitting in either working tree. The Android
+repositories themselves have not been modified by this session (see item 19 in
+the checklist above) and will not be, regardless of how this integrity item is
+eventually resolved - that decision belongs to whoever owns Android baseline
+management, as a separate, explicitly out-of-scope-for-Foundation action.
 
 Both read-only Android reference repos currently have **uncommitted working-tree
 changes**, independently re-confirmed via `git status`/`git diff`/`stat` immediately
@@ -295,8 +376,21 @@ additional coverage beyond, not a renumbering of, the required `CT-PKT-001~003`/
 
 ## Modified files (this round)
 
-11 commits total on `foundation/contract-v1` from base to current Implementation
-SHA (`git log --oneline`, run directly):
+**Current round** (prior HEAD `fc0aa62`..Implementation SHA `941545f`): 3 files
+changed, 271 insertions(+), 17 deletions(-), 1 commit:
+
+```text
+include/savvy/platform/ipc_cancel.h
+src/platform/linux/ipc/ipc_transport_common.c
+tests/contract/test_ipc.c
+```
+
+All three fall within the Allowed paths list for this round
+(`include/**/platform/**`, `src/platform/linux/ipc/**`, `tests/contract/**`).
+
+Full base..HEAD session total (all rounds): 15 commits, 61 files changed, 9585
+insertions(+), 0 deletions(-) (`git log --oneline`/`git diff --stat`, run
+directly):
 
 ```text
 e1adac6 foundation: FND-01 packet codec, FND-04 core interfaces, cJSON vendor, CMake scaffolding
@@ -310,33 +404,15 @@ b5204e8 foundation: SESSION_RESULT.md
 cde953b fix: address Codex V0A/V0B foundation review findings
 92142bd docs: update SESSION_RESULT.md for Codex-review fix round
 2a068ef fix: address Codex re-verification findings (V0R-H-01, F-07, V0B-H-02, F-08)
+0e0350a docs: update SESSION_RESULT.md for Codex re-verification round
+c9cd633 fix: remove literal forbidden-status substrings and align resync test data with V0R-H-01
+fc0aa62 docs: record the independent verification pass and final touch-up SHA
+941545f fix: FINAL-M-01 timeout_ms==0 semantics and FINAL-M-02 cancel EINTR handling
 ```
 
-**This round only** (prior report commit `92142bd`..Implementation SHA
-`2a068ef`): 17 files changed, 1112 insertions(+), 58 deletions(-), 1 commit:
-
-```text
-CMakeLists.txt
-include/savvy/core/error.h
-include/savvy/platform/ipc_cancel.h                (new)
-include/savvy/platform/ipc_client.h
-include/savvy/platform/ipc_reconnect.h             (new)
-include/savvy/protocol/ipc_action_catalog.h
-src/core/error.c
-src/platform/interfaces/CMakeLists.txt             (new)
-src/platform/interfaces/ipc_reconnect.c            (new)
-src/platform/linux/ipc/ipc_client.c
-src/platform/linux/ipc/ipc_transport_common.c
-src/platform/linux/ipc/ipc_transport_common.h
-src/protocol/ipc/ipc_action_catalog.c
-tests/contract/CMakeLists.txt
-tests/contract/test_ipc.c
-tests/contract/test_json.c
-tests/contract/test_packet.c
-```
-
-Full base..HEAD session total: 61 files changed, 9140 insertions(+), 0
-deletions(-). All paths fall within the Allowed paths list (item 18 above).
+The prior round's own file list (17 files, 1112 insertions(+), 58 deletions(-))
+is unchanged from what's recorded further below in the historical 23-item
+section. All paths across every round fall within the Allowed paths list.
 Local `build/` directories and stray `.omc/` framework artifacts (regenerated/
 recreated by tooling, never staged) were removed before this round's commit.
 
@@ -391,10 +467,20 @@ ctest --test-dir <build_path> --output-on-failure
     CT-IPC-001 .......... Passed
     CT-IPC-002 .......... Passed
     CT-IPC-003 .......... Passed
-    CT-IPC-CANCEL ........ Passed  (3.06s - the only test with genuine
-                                    multi-threaded/multi-process wait time;
-                                    all others complete in <0.1s)
+    CT-IPC-CANCEL ........ Passed  (3.32s, current round - grew from 3.06s as
+                                    this round added the FINAL-M-01 timeout=0
+                                    matrix and FINAL-M-02 EINTR-bombardment
+                                    sub-tests to the same binary; all other
+                                    tests still complete in <0.1s)
 ```
+
+`ctest --output-on-failure` only prints a test's stdout when it fails, so a
+passing `CT-IPC-CANCEL` line alone doesn't show each individual `CHECK` inside
+it. Since this round added 8 new checks to it (sensor: `004H1`-`004H6` for
+FINAL-M-01, `004C3` for FINAL-M-02) and their outcome matters for this
+specific report, `test_ipc 004` was also run **standalone**, directly, in a
+throwaway container (same image, same build), to see every line: **36/36
+individual checks passed**, including every `004H*`/`004C3` name explicitly.
 
 Environment: `savvy-foundation-test:ubuntu22.04-arm64-v1`, GCC 11.4.0, CMake
 3.22.1, Ninja 1.10.1, `linux/arm64`. Full raw logs written to
@@ -481,15 +567,45 @@ for the full prior text, not repeated verbatim here.
 
 ## Blockers and incomplete items
 
-1. **Android baseline integrity (URGENT)** - see the dedicated section above. Still not resolved; needs a separately-approved recovery/audit action.
-2. **`keepServerIp` default mismatch** between `savvy_mgr` and `savvy_sensor` - still not resolved (needs a `SCOPE_CHANGE_REQUEST` owner decision on which value, if either, is production-correct). This round only corrected this document's own historical description of it (see above); no code value changed this round.
-3. **`DataResult` Gson-unsafe-allocation risk** - flagged, not independently verified by executing real Android/Gson bytecode.
-4. **RV1106 cross-build**: `PENDING`, blocked on B-005, out of this session's scope.
-5. **`SO_PEERCRED`/production socket path**: explicitly `DEFERRED_PRODUCTION_SECURITY` per DEC-20260714-02.
-6. **`getBytesAsLen()` serial-overflow bug**: unchanged from prior rounds - Android-side risk, FND-01 deliberately does not reproduce it, not fixed here since FND-01 never implements a concrete serial provider.
-7. **`contracts/bt_spp.md`/`tcp_8140.md`**: remain 0-byte placeholders, out of FND-01~04 scope.
-8. No `CONTRACT_CHANGE_REQUEST` filed - none of this round's fixes altered the wire contract.
-9. **New this round, informational**: the Docker image built locally does not match the Image ID stated in the task prompt (see "Docker Linux build/test" above) - the specified tag was not present on this machine; verification proceeded against a freshly-built image from the same provided Dockerfile instead.
+Per FINAL-L-01, two items previously listed here are **not Foundation code
+blockers** and have been moved to their own sections instead: Android baseline
+integrity (see the dedicated section near the top of this document) and the
+`keepServerIp` per-application divergence (now recorded as an approved design
+decision, see "Approved: keepServerIp divergence" below, not an open question).
+
+1. **RV1106 cross-build**: `PENDING`, blocked on B-005, out of this session's scope.
+2. **`SO_PEERCRED`/production socket path**: explicitly `DEFERRED_PRODUCTION_SECURITY` per DEC-20260714-02.
+3. **`getBytesAsLen()` serial-overflow bug**: unchanged from prior rounds - Android-side risk, FND-01 deliberately does not reproduce it, not fixed here since FND-01 never implements a concrete serial provider.
+4. **`contracts/bt_spp.md`/`tcp_8140.md`**: remain 0-byte placeholders, out of FND-01~04 scope.
+5. No `CONTRACT_CHANGE_REQUEST` filed - none of this round's fixes altered the wire contract.
+6. **New this round, informational**: the Docker image built locally does not match the Image ID stated in the task prompt (see "Docker Linux build/test" above) - the specified tag was not present on this machine; verification proceeded against a freshly-built image from the same provided Dockerfile instead.
+
+See also "Pre-tag compatibility evidence" below for the `DataResult` Gson item,
+which remains open (not resolved) but is tracked separately from "Blockers"
+since it does not block this session's own completion.
+
+## Approved: keepServerIp divergence (not a blocker)
+
+Per FINAL-L-01: `sensor_to_Linux` (`13.125.173.114`) and `mgr_to_Linux`
+(`15.165.113.212`) each match their own app's real, independently-confirmed
+Android compiled default (see "keepServerIp - corrected history" above for the
+full history and citations). This is the **approved** per-application Android
+baseline - the two values are not a unification target, this is not an open
+`SCOPE_CHANGE_REQUEST` decision, and this item does not block anything.
+
+## Pre-tag compatibility evidence (open, not recorded as resolved)
+
+`DataResult`'s Gson-unsafe-allocation risk - a missing `"result"` key could
+plausibly deserialize to `0` (danger) rather than the `4` (normal) field
+initializer on real Android, since a class with no no-arg constructor forces
+Gson 2.8.2 into unsafe/no-constructor allocation, which bypasses field
+initializers - has **not** been independently verified by executing real
+Android/Gson bytecode. This remains open and is deliberately kept out of
+"Blockers" above (it does not block this session's own completion: CT-JSON-002
+already specifies, and this codebase already implements, the safer of the two
+candidate behaviors regardless of which one Gson actually exhibits) - but it is
+explicitly **not recorded as resolved**, and should be tracked as outstanding
+pre-tag compatibility evidence for whoever owns the `contract-v1` tag decision.
 
 ## Contract change
 
@@ -508,10 +624,9 @@ None. No wire contract, envelope schema, or field policy was modified this round
 
 ## Next dependency / handoff
 
-- **Android baseline integrity recovery** (see dedicated section above) - still the highest-priority open item.
-- Codex re-verification of this round's fixes (V0R-H-01, F-07, V0B-H-02, F-08).
+- Codex re-verification of this round's fixes (V0R-H-01, F-07, V0B-H-02, F-08, and the FINAL-M-01/FINAL-M-02/FINAL-L-01 follow-ups).
 - User review and Gate approval; `contract-v1` tag creation happens only after that.
-- User/Cowork decision on the `keepServerIp` drift (Blockers item 2).
-- Optional: empirical verification of `DataResult`'s actual Gson deserialization behavior on a real device/emulator (Blockers item 3).
+- Android baseline integrity recovery (see the dedicated section above) - a real, separate, unresolved audit item, tracked independently of this Foundation session's own completion (per FINAL-L-01, not a blocker on it).
+- `DataResult`'s Gson deserialization behavior - optional empirical verification on a real device/emulator before `contract-v1` is tagged (see "Pre-tag compatibility evidence" above; not resolved, not blocking).
 - B-005 (RV1106 SDK/toolchain) resolution, whenever cross-build work is scheduled.
 - Wave 1 sessions (`CC-SENSOR-CORE`, `CC-SENSOR-STREAM`, and `CC-MGR-CORE`/`CC-MGR-SERVER` in the counterpart repo) can consume the FND-01~04 headers/codecs, including the new `savvy_ipc_reconnect_tracker_t` hook and `savvy_ipc_cancel_source_t` cancellation primitive, committed here.
