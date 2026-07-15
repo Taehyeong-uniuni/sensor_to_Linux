@@ -6,7 +6,7 @@
 - Branch: `feature/sensor-core`
 - Foundation base: `07809cb1f3f2b86a8e92ade661c48cb3adb97b52` (`contract-v1` annotated tag)
 - Original implementation SHA: `800207949dc28a6e18a3eafe4399f8cb0eb3d811`
-- Codex finding fix SHA: `PENDING_FIX_COMMIT`
+- Codex finding fix SHA: `0f01c25f3c7ae55ca0e5650ce69015006ab1ef6e`
 - Fix-result report SHA: `PENDING_FIX_REPORT_COMMIT`
 - Original implementation diff (`contract-v1...8002079`): 37 files, 37 added / 0 modified / 0 deleted. The prior `35 files` statement was incorrect.
 
