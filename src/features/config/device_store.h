@@ -49,17 +49,20 @@ savvy_status_t sensor_device_store_load_cached(sensor_device_store_t *store,
                                                 const char *cached_json,
                                                 size_t cached_len);
 
-/* Runtime path - mirrors Android actionDevice(): parses `json` onto the
- * current working value (missing keys retain their existing value), does
- * NOT reset the 9 stateful fields (isInited=false path), diffs
- * dataCollection unconditionally. A rejected parse (S-003) leaves `store`
- * and *out_result untouched. */
+/* Runtime path - mirrors Android actionDevice(): parses `json` into a
+ * fresh Foundation-default Device (no merge with the previous live
+ * Device), does NOT reset the 9 stateful fields (isInited=false path), and
+ * publishes typed value plus exact raw JSON as one snapshot. A rejected
+ * parse leaves both previous values and *out_result untouched. */
 savvy_status_t sensor_device_store_apply_runtime(sensor_device_store_t *store,
                                                   const char *json, size_t len,
                                                   sensor_device_apply_result_t *out_result);
 
 savvy_snapshot_handle_t *sensor_device_store_acquire(sensor_device_store_t *store, uint64_t *out_version);
 const savvy_device_t *sensor_device_snapshot_payload(savvy_snapshot_handle_t *handle);
+/* Returns raw JSON paired with this handle's typed Device. The returned
+ * pointer is valid until sensor_device_store_release() for this handle. */
+const char *sensor_device_snapshot_raw_json(savvy_snapshot_handle_t *handle, size_t *out_len);
 void sensor_device_store_release(sensor_device_store_t *store, savvy_snapshot_handle_t *handle);
 
 #ifdef __cplusplus

@@ -7,6 +7,36 @@ static void config_payload_free(void *payload) {
     free(payload);
 }
 
+/* Keep the typed value and the exact successful input in one Foundation
+ * snapshot.  `value` is deliberately first so the established typed
+ * accessor remains a pointer to savvy_config_t, while the raw accessor
+ * below can use the same handle and therefore the same reader lifetime. */
+typedef struct config_snapshot_payload {
+    savvy_config_t value;
+    size_t raw_json_len;
+    char raw_json[];
+} config_snapshot_payload_t;
+
+static config_snapshot_payload_t *config_payload_create(const savvy_config_t *value,
+                                                         const char *raw_json,
+                                                         size_t raw_json_len) {
+    if (raw_json_len > SIZE_MAX - sizeof(config_snapshot_payload_t) - 1u) {
+        return NULL;
+    }
+
+    config_snapshot_payload_t *payload = malloc(sizeof(*payload) + raw_json_len + 1u);
+    if (payload == NULL) {
+        return NULL;
+    }
+    payload->value = *value;
+    payload->raw_json_len = raw_json_len;
+    if (raw_json_len > 0) {
+        memcpy(payload->raw_json, raw_json, raw_json_len);
+    }
+    payload->raw_json[raw_json_len] = '\0';
+    return payload;
+}
+
 savvy_status_t sensor_config_store_init(sensor_config_store_t *store) {
     if (store == NULL) {
         return SAVVY_ERR_INVALID_ARGUMENT;
@@ -54,13 +84,13 @@ savvy_status_t sensor_config_store_load_cached(sensor_config_store_t *store,
         return st;
     }
 
-    savvy_config_t *copy = malloc(sizeof(*copy));
+    const char *raw_json = cached_json != NULL ? cached_json : "";
+    size_t raw_json_len = (cached_json != NULL && cached_len > 0) ? cached_len : 0;
+    config_snapshot_payload_t *copy = config_payload_create(&scratch, raw_json, raw_json_len);
     if (copy == NULL) {
         pthread_mutex_unlock(&store->write_lock);
         return SAVVY_ERR_OUT_OF_MEMORY;
     }
-    memcpy(copy, &scratch, sizeof(*copy));
-
     st = savvy_snapshot_publish(&store->snapshot, copy);
     if (st != SAVVY_OK) {
         free(copy);
@@ -83,24 +113,23 @@ savvy_status_t sensor_config_store_apply_runtime(sensor_config_store_t *store,
 
     pthread_mutex_lock(&store->write_lock);
 
-    /* Parse onto a scratch copy of the current value so a rejected parse
-     * (S-003: malformed input -> reject, never crash) leaves `store`
-     * completely untouched - Foundation's own parse contract doesn't
-     * promise atomicity on a rejected call, so this store supplies it. */
-    savvy_config_t scratch = store->working;
+    /* Android actionConfig() assigns gson.fromJson()'s newly-created DTO;
+     * it never merges a partial message into the previous live DTO.  The
+     * Foundation codec follows its documented partial-write contract, so
+     * start from Foundation defaults on every runtime message. */
+    savvy_config_t scratch;
+    savvy_config_set_defaults(&scratch);
     savvy_status_t st = savvy_config_parse(json, len, &scratch, NULL);
     if (st != SAVVY_OK) {
         pthread_mutex_unlock(&store->write_lock);
         return st;
     }
 
-    savvy_config_t *copy = malloc(sizeof(*copy));
+    config_snapshot_payload_t *copy = config_payload_create(&scratch, json, len);
     if (copy == NULL) {
         pthread_mutex_unlock(&store->write_lock);
         return SAVVY_ERR_OUT_OF_MEMORY;
     }
-    memcpy(copy, &scratch, sizeof(*copy));
-
     st = savvy_snapshot_publish(&store->snapshot, copy);
     if (st != SAVVY_OK) {
         free(copy);
@@ -141,6 +170,21 @@ const savvy_config_t *sensor_config_snapshot_payload(savvy_snapshot_handle_t *ha
         return NULL;
     }
     return (const savvy_config_t *)savvy_snapshot_payload(handle);
+}
+
+const char *sensor_config_snapshot_raw_json(savvy_snapshot_handle_t *handle, size_t *out_len) {
+    if (handle == NULL) {
+        return NULL;
+    }
+    const config_snapshot_payload_t *payload =
+        (const config_snapshot_payload_t *)savvy_snapshot_payload(handle);
+    if (payload == NULL) {
+        return NULL;
+    }
+    if (out_len != NULL) {
+        *out_len = payload->raw_json_len;
+    }
+    return payload->raw_json;
 }
 
 void sensor_config_store_release(sensor_config_store_t *store, savvy_snapshot_handle_t *handle) {

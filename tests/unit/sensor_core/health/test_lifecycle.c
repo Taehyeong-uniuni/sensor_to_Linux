@@ -34,6 +34,77 @@ static void on_shutdown(void *ud) {
     m->shutdown_calls++;
 }
 
+typedef struct reentrant_module {
+    sensor_lifecycle_t *lc;
+    int start_calls;
+    int config_calls;
+    int shutdown_calls;
+    int extra_config_calls;
+    bool registered_extra;
+    bool nested_config_sent;
+} reentrant_module_t;
+
+static void reentrant_extra_config(void *ud) {
+    reentrant_module_t *m = (reentrant_module_t *)ud;
+    m->extra_config_calls++;
+}
+
+static void reentrant_start(void *ud) {
+    reentrant_module_t *m = (reentrant_module_t *)ud;
+    m->start_calls++;
+    /* Reentering start on an already-running lifecycle is a no-op, but it
+     * must not deadlock on the registry mutex. */
+    assert(sensor_lifecycle_start(m->lc) == SAVVY_OK);
+}
+
+static void reentrant_config(void *ud) {
+    reentrant_module_t *m = (reentrant_module_t *)ud;
+    m->config_calls++;
+    if (!m->registered_extra) {
+        m->registered_extra = true;
+        sensor_lifecycle_hooks_t extra = {"registered-from-callback", NULL,
+                                          reentrant_extra_config, NULL, m};
+        assert(sensor_lifecycle_register_module(m->lc, &extra) == SAVVY_OK);
+    }
+    if (!m->nested_config_sent) {
+        m->nested_config_sent = true;
+        sensor_lifecycle_notify_config_applied(m->lc);
+    }
+}
+
+static void reentrant_shutdown(void *ud) {
+    reentrant_module_t *m = (reentrant_module_t *)ud;
+    m->shutdown_calls++;
+    /* STOPPED->STOPPED is idempotent and, crucially, lock-free for a
+     * callback caller. */
+    assert(sensor_lifecycle_stop(m->lc) == SAVVY_OK);
+}
+
+static void test_reentrant_callbacks_snapshot_policy(void) {
+    sensor_lifecycle_t lc;
+    assert(sensor_lifecycle_init(&lc) == SAVVY_OK);
+
+    reentrant_module_t module = {0};
+    module.lc = &lc;
+    sensor_lifecycle_hooks_t hooks = {"reentrant", reentrant_start,
+                                      reentrant_config, reentrant_shutdown, &module};
+    assert(sensor_lifecycle_register_module(&lc, &hooks) == SAVVY_OK);
+
+    assert(sensor_lifecycle_start(&lc) == SAVVY_OK);
+    assert(module.start_calls == 1);
+
+    /* The extra module is registered during the outer callback and is not
+     * in that snapshot; it is present in the nested, subsequent fan-out. */
+    sensor_lifecycle_notify_config_applied(&lc);
+    assert(module.config_calls == 2);
+    assert(module.extra_config_calls == 1);
+
+    assert(sensor_lifecycle_stop(&lc) == SAVVY_OK);
+    assert(module.shutdown_calls == 1);
+    sensor_lifecycle_destroy(&lc);
+    printf("SENSOR-CORE-LIFECYCLE-REENTRANT: OK\n");
+}
+
 static void test_007_shutdown_fanout_and_registration_order(void) {
     sensor_lifecycle_t lc;
     assert(sensor_lifecycle_init(&lc) == SAVVY_OK);
@@ -147,6 +218,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "007") == 0) {
         test_007_shutdown_fanout_and_registration_order();
+        test_reentrant_callbacks_snapshot_policy();
     } else if (strcmp(argv[1], "idempotent") == 0) {
         test_idempotent_start_stop();
         test_overflow_rejected();

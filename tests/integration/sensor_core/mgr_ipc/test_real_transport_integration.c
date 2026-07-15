@@ -35,6 +35,7 @@ typedef struct test_recorder {
     int reconnect_count;
     int disconnect_count;
     int action_count;
+    char actions[8][128];
 } test_recorder_t;
 
 static void recorder_init(test_recorder_t *r) {
@@ -61,11 +62,13 @@ static void on_disconnected_cb(void *ud) {
     pthread_mutex_unlock(&r->lock);
 }
 static void on_envelope_cb(const char *action, const char *payload_json, void *ud) {
-    (void)action;
     (void)payload_json;
     test_recorder_t *r = (test_recorder_t *)ud;
     pthread_mutex_lock(&r->lock);
-    r->action_count++;
+    if (r->action_count < 8) {
+        snprintf(r->actions[r->action_count], sizeof(r->actions[0]), "%s", action);
+        r->action_count++;
+    }
     pthread_mutex_unlock(&r->lock);
 }
 
@@ -152,6 +155,8 @@ int main(void) {
 
     assert(wait_until_ge(get_connect_count, &recorder, 1, 5000));
     assert(wait_until_ge(get_action_count, &recorder, 2, 5000)); /* CONFIG + DEVICE */
+    assert(strcmp(recorder.actions[0], SENSOR_MGR_IPC_ACTION_CONFIG) == 0);
+    assert(strcmp(recorder.actions[1], SENSOR_MGR_IPC_ACTION_DEVICE) == 0);
 
     /* mock_mgr's first cycle closes after ~1000ms -> Sensor must detect
      * recv()==0 and reconnect on its own. */
@@ -159,12 +164,16 @@ int main(void) {
     assert(wait_until_ge(get_connect_count, &recorder, 2, 5000));
     assert(recorder.reconnect_count == 1);
     assert(wait_until_ge(get_action_count, &recorder, 4, 5000)); /* CONFIG + DEVICE again */
+    assert(strcmp(recorder.actions[2], SENSOR_MGR_IPC_ACTION_CONFIG) == 0);
+    assert(strcmp(recorder.actions[3], SENSOR_MGR_IPC_ACTION_DEVICE) == 0);
 
     assert(sensor_mgr_ipc_client_stop(client) == SAVVY_OK);
     sensor_mgr_ipc_client_destroy(client);
 
     int status = 0;
     waitpid(mgr_pid, &status, 0);
+    assert(WIFEXITED(status));
+    assert(WEXITSTATUS(status) == 0);
 
     printf("CT-IPC-002-real: OK\n");
     return 0;

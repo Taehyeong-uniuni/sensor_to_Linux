@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,42 +71,76 @@ static int send_envelope(int fd, const char *action, const char *payload_json) {
     return rc;
 }
 
-static void drain_and_log(int fd, int64_t deadline_ms) {
+static int expect_connect_handshake(int fd, int64_t deadline_ms) {
     char buf[65536 + 1];
-    for (;;) {
+    while (now_ms() < deadline_ms) {
         int64_t remaining = deadline_ms - now_ms();
-        if (remaining <= 0) {
-            return;
-        }
-        struct pollfd pfd;
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
+        struct pollfd pfd = {fd, POLLIN, 0};
         int pr = poll(&pfd, 1, (int)remaining);
+        if (pr < 0 && errno == EINTR) {
+            continue;
+        }
         if (pr <= 0) {
-            continue; /* timeout slice elapsed or EINTR - re-check deadline */
+            break;
         }
         ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) {
+            break;
+        }
+        buf[n] = '\0';
+        savvy_ipc_envelope_t env;
+        if (savvy_ipc_envelope_parse(buf, (size_t)n, &env) != SAVVY_OK) {
+            fprintf(stderr, "mock_mgr: malformed first message\n");
+            return -1;
+        }
+        bool valid = strcmp(env.action, "com.uniuni.savvymgr.ipc.connect") == 0 &&
+                     strcmp(env.payload_json, "{}") == 0;
+        savvy_ipc_envelope_free(&env);
+        if (!valid) {
+            fprintf(stderr, "mock_mgr: expected CONNECT_BROADCAST_IPC with {} payload\n");
+            return -1;
+        }
+        printf("mock_mgr: CONNECT handshake verified\n");
+        return 0;
+    }
+    fprintf(stderr, "mock_mgr: CONNECT handshake missing\n");
+    return -1;
+}
+
+/* Config/Device are MGR->Sensor only. Any second Sensor->MGR record before
+ * this mock closes the cycle proves cached replay or an unexpected outbound
+ * action, so fail the child process for the integration test to observe. */
+static int reject_unexpected_sensor_messages(int fd, int64_t deadline_ms) {
+    char buf[65536 + 1];
+    while (now_ms() < deadline_ms) {
+        int64_t remaining = deadline_ms - now_ms();
+        struct pollfd pfd = {fd, POLLIN, 0};
+        int pr = poll(&pfd, 1, (int)remaining);
+        if (pr < 0 && errno == EINTR) {
+            continue;
+        }
+        if (pr == 0) {
+            return 0;
+        }
+        if (pr < 0) {
+            fprintf(stderr, "mock_mgr: poll error: %s\n", strerror(errno));
+            return -1;
+        }
+        ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+        if (n == 0) {
+            return 0; /* driving test stopped the client */
+        }
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
             fprintf(stderr, "mock_mgr: recv error: %s\n", strerror(errno));
-            return;
+            return -1;
         }
-        if (n == 0) {
-            printf("mock_mgr: client disconnected\n");
-            return;
-        }
-        buf[n] = '\0';
-        savvy_ipc_envelope_t env;
-        if (savvy_ipc_envelope_parse(buf, (size_t)n, &env) == SAVVY_OK) {
-            printf("mock_mgr: received action=%s payload=%s\n", env.action, env.payload_json);
-            savvy_ipc_envelope_free(&env);
-        } else {
-            printf("mock_mgr: received %zd unparseable bytes\n", n);
-        }
+        fprintf(stderr, "mock_mgr: unexpected Sensor message after CONNECT (%zd bytes)\n", n);
+        return -1;
     }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -174,16 +209,14 @@ int main(int argc, char **argv) {
         }
         printf("mock_mgr: accepted connection\n");
 
-        /* Drain the expected CONNECT_BROADCAST_IPC handshake (log
-         * whatever arrives; not strictly required before pushing
-         * Config/Device, but mirrors the real order: Sensor connects,
-         * sends CONNECT, MGR then pushes Config then Device). */
-        drain_and_log(client_fd, now_ms() + 2000);
-
-        send_envelope(client_fd, "com.uniuni.savvysensor.config", "{\"jsonConfigDto\":{}}");
-        send_envelope(client_fd, "com.uniuni.savvysensor.device", "{\"jsonDeviceDto\":{}}");
-
-        drain_and_log(client_fd, now_ms() + hold_open_ms);
+        if (expect_connect_handshake(client_fd, now_ms() + 2000) != 0 ||
+            send_envelope(client_fd, "com.uniuni.savvysensor.config", "{\"jsonConfigDto\":{}}") != 0 ||
+            send_envelope(client_fd, "com.uniuni.savvysensor.device", "{\"jsonDeviceDto\":{}}") != 0 ||
+            reject_unexpected_sensor_messages(client_fd, now_ms() + hold_open_ms) != 0) {
+            exit_code = 1;
+            close(client_fd);
+            break;
+        }
 
         close(client_fd);
         printf("mock_mgr: closed connection (cycle %d/%d)\n", cycle + 1, cycles);

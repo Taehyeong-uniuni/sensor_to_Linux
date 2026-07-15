@@ -8,11 +8,13 @@
 
 #include "fake_transport.h"
 #include "mgr_ipc_client.h"
+#include "savvy/protocol/ipc_envelope.h"
 
 #include <assert.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -24,6 +26,8 @@ typedef struct test_recorder {
     int disconnect_count;
     char actions[32][128];
     int action_count;
+    sensor_mgr_ipc_client_t *callback_client;
+    int callback_lifecycle_action; /* 0 none, 1 stop, 2 destroy */
 } test_recorder_t;
 
 static void recorder_init(test_recorder_t *r) {
@@ -32,6 +36,8 @@ static void recorder_init(test_recorder_t *r) {
     r->reconnect_count = 0;
     r->disconnect_count = 0;
     r->action_count = 0;
+    r->callback_client = NULL;
+    r->callback_lifecycle_action = 0;
 }
 
 static void on_connected_cb(bool was_reconnect, void *ud) {
@@ -42,6 +48,14 @@ static void on_connected_cb(bool was_reconnect, void *ud) {
         r->reconnect_count++;
     }
     pthread_mutex_unlock(&r->lock);
+
+    /* The client deliberately invokes callbacks without its state/I/O
+     * locks. Exercise both worker-self lifecycle paths here. */
+    if (r->callback_lifecycle_action == 1) {
+        assert(sensor_mgr_ipc_client_stop(r->callback_client) == SAVVY_OK);
+    } else if (r->callback_lifecycle_action == 2) {
+        sensor_mgr_ipc_client_destroy(r->callback_client);
+    }
 }
 
 static void on_disconnected_cb(void *ud) {
@@ -182,6 +196,7 @@ static void test_ct_ipc_002_reconnect(void) {
     test_recorder_t recorder;
     recorder_init(&recorder);
     sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+    config.recv_poll_timeout_ms = 1000;
 
     sensor_mgr_ipc_client_t *client = NULL;
     assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
@@ -202,6 +217,7 @@ static void test_ct_ipc_002_reconnect(void) {
 
     const char *config_env = "{\"action\":\"com.uniuni.savvysensor.config\",\"payload\":{\"jsonConfigDto\":{}}}";
     const char *device_env = "{\"action\":\"com.uniuni.savvysensor.device\",\"payload\":{\"jsonDeviceDto\":{}}}";
+
     assert(fake_mgr_send(mgr_fd1, config_env, strlen(config_env)));
     assert(fake_mgr_send(mgr_fd1, device_env, strlen(device_env)));
 
@@ -236,6 +252,137 @@ static void test_ct_ipc_002_reconnect(void) {
     printf("CT-IPC-002: OK\n");
 }
 
+static void test_application_message_size_boundaries(void) {
+    const char *empty_payload = "{\"x\":\"\"}";
+    char *text = NULL;
+    size_t base_len = 0;
+    assert(savvy_ipc_envelope_build(SENSOR_MGR_IPC_ACTION_CONNECT, empty_payload,
+                                    &text, &base_len) == SAVVY_OK);
+    free(text);
+
+    size_t payload_len = strlen(empty_payload) + (SAVVY_IPC_MAX_MESSAGE - base_len);
+    char *payload = malloc(payload_len + 2u);
+    assert(payload != NULL);
+    const char *prefix = "{\"x\":\"";
+    const char *suffix = "\"}";
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    assert(prefix_len + suffix_len <= payload_len);
+    memcpy(payload, prefix, prefix_len);
+    memset(payload + prefix_len, 'x', payload_len - prefix_len - suffix_len);
+    memcpy(payload + payload_len - suffix_len, suffix, suffix_len);
+    payload[payload_len] = '\0';
+
+    size_t encoded_len = 0;
+    assert(savvy_ipc_envelope_build(SENSOR_MGR_IPC_ACTION_CONNECT, payload,
+                                    &text, &encoded_len) == SAVVY_OK);
+    assert(encoded_len == SAVVY_IPC_MAX_MESSAGE);
+    free(text);
+
+    /* Inserting one more JSON character before the suffix makes the encoded
+     * application record 65,537 bytes and must be rejected before send. */
+    memmove(payload + payload_len - suffix_len + 1u,
+            payload + payload_len - suffix_len, suffix_len + 1u);
+    payload[payload_len - suffix_len] = 'y';
+    payload_len += 1u;
+    assert(savvy_ipc_envelope_build(SENSOR_MGR_IPC_ACTION_CONNECT, payload,
+                                    &text, &encoded_len) == SAVVY_ERR_OVERFLOW);
+    free(payload);
+}
+
+static void test_inbound_rejection_and_oversize_recovery(void) {
+    fake_connector_ctx_t connector_ctx;
+    assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+
+    test_recorder_t recorder;
+    recorder_init(&recorder);
+    sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+    sensor_mgr_ipc_client_t *client = NULL;
+    assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+    assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
+
+    int mgr_fd = fake_mgr_dequeue_fd(&connector_ctx);
+    assert(mgr_fd >= 0);
+    char handshake[256];
+    size_t handshake_len = 0;
+    assert(fake_mgr_recv(mgr_fd, handshake, sizeof(handshake), &handshake_len, 2000));
+    assert(wait_until_ge(get_connect_count, &recorder, 1, 2000));
+
+    /* Invalid JSON, a Sensor->MGR action received in the wrong direction,
+     * and a schema-invalid Config envelope must all be discarded. */
+    assert(fake_mgr_send(mgr_fd, "{malformed", strlen("{malformed")));
+    assert(fake_mgr_send(mgr_fd,
+                         "{\"action\":\"com.uniuni.savvymgr.ipc.connect\",\"payload\":{}}",
+                         strlen("{\"action\":\"com.uniuni.savvymgr.ipc.connect\",\"payload\":{}}")));
+    assert(fake_mgr_send(mgr_fd,
+                         "{\"action\":\"com.uniuni.savvysensor.config\",\"payload\":{\"wrong\":1}}",
+                         strlen("{\"action\":\"com.uniuni.savvysensor.config\",\"payload\":{\"wrong\":1}}")));
+
+    /* The framed fake transport drains an entire >64 KiB record and emits
+     * SAVVY_ERR_OVERFLOW. The worker must then consume this valid record. */
+    size_t oversized_len = SAVVY_IPC_MAX_MESSAGE + 1u;
+    char *oversized = malloc(oversized_len);
+    assert(oversized != NULL);
+    memset(oversized, 'x', oversized_len);
+    assert(fake_mgr_send(mgr_fd, oversized, oversized_len));
+    free(oversized);
+
+    const char *valid_config =
+        "{\"action\":\"com.uniuni.savvysensor.config\",\"payload\":{\"jsonConfigDto\":{}}}";
+    assert(fake_mgr_send(mgr_fd, valid_config, strlen(valid_config)));
+    assert(wait_until_ge(get_action_count, &recorder, 1, 2000));
+    assert(recorder.action_count == 1);
+    assert(strcmp(recorder.actions[0], SENSOR_MGR_IPC_ACTION_CONFIG) == 0);
+
+    fake_mgr_close(mgr_fd);
+    assert(sensor_mgr_ipc_client_stop(client) == SAVVY_OK);
+    sensor_mgr_ipc_client_destroy(client);
+    fake_connector_destroy(&connector_ctx);
+}
+
+static void test_connect_handshake_failures(void) {
+    const savvy_status_t failures[] = {SAVVY_ERR_TIMEOUT, SAVVY_ERR_CLOSED, SAVVY_ERR_IO};
+    for (size_t i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
+        fake_connector_ctx_t connector_ctx;
+        assert(fake_connector_init(&connector_ctx, 4) == SAVVY_OK);
+        fake_connector_fail_next_sends(&connector_ctx, 1, failures[i]);
+
+        test_recorder_t recorder;
+        recorder_init(&recorder);
+        sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+        config.reconnect_backoff_ms = 5;
+
+        sensor_mgr_ipc_client_t *client = NULL;
+        assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+        assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
+
+        /* The failed CONNECT is closed and never fires on_connected. The
+         * succeeding retry is the one and only connected callback. */
+        int failed_fd = fake_mgr_dequeue_fd(&connector_ctx);
+        assert(failed_fd >= 0);
+        char buf[256];
+        size_t len = 0;
+        assert(fake_mgr_recv(failed_fd, buf, sizeof(buf), &len, 2000));
+        assert(len == 0);
+        fake_mgr_close(failed_fd);
+
+        int good_fd = fake_mgr_dequeue_fd(&connector_ctx);
+        assert(good_fd >= 0);
+        assert(fake_mgr_recv(good_fd, buf, sizeof(buf), &len, 2000));
+        buf[len] = '\0';
+        assert(strstr(buf, SENSOR_MGR_IPC_ACTION_CONNECT) != NULL);
+        assert(wait_until_ge(get_connect_count, &recorder, 1, 2000));
+        assert(get_connect_count(&recorder) == 1);
+        assert(fake_connector_close_count(&connector_ctx) >= 1);
+
+        fake_mgr_close(good_fd);
+        assert(sensor_mgr_ipc_client_stop(client) == SAVVY_OK);
+        sensor_mgr_ipc_client_destroy(client);
+        fake_connector_destroy(&connector_ctx);
+    }
+    printf("CT-IPC-002 handshake failures: OK\n");
+}
+
 static long count_open_fds(void) {
     DIR *d = opendir("/dev/fd");
     if (d == NULL) {
@@ -262,6 +409,7 @@ static void test_006_repeated_connect_disconnect(void) {
     sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
     config.reconnect_backoff_ms = 5;
 
+    long fds_baseline = count_open_fds();
     sensor_mgr_ipc_client_t *client = NULL;
     assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
     assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
@@ -288,9 +436,155 @@ static void test_006_repeated_connect_disconnect(void) {
     assert(fds_after <= fds_before + 4);
 
     sensor_mgr_ipc_client_stop(client);
+    long fds_final = count_open_fds();
+    assert(fds_baseline >= 0 && fds_final >= 0);
+    /* count_open_fds itself opens the directory it reads, so both samples
+     * have the same one-descriptor measurement overhead. No client fd may
+     * remain after stop/join. */
+    assert(fds_final <= fds_baseline + 1);
     sensor_mgr_ipc_client_destroy(client);
     fake_connector_destroy(&connector_ctx);
-    printf("SNS-CORE-006: OK (fds_before=%ld fds_after=%ld over %d cycles)\n", fds_before, fds_after, cycles);
+    printf("SNS-CORE-006: OK (baseline=%ld cycle=%ld final=%ld over %d cycles)\n",
+           fds_baseline, fds_after, fds_final, cycles);
+}
+
+typedef struct lifecycle_thread_arg {
+    sensor_mgr_ipc_client_t *client;
+    savvy_status_t status;
+} lifecycle_thread_arg_t;
+
+static void *stop_thread_main(void *arg) {
+    lifecycle_thread_arg_t *thread_arg = (lifecycle_thread_arg_t *)arg;
+    thread_arg->status = sensor_mgr_ipc_client_stop(thread_arg->client);
+    return NULL;
+}
+
+static void *destroy_thread_main(void *arg) {
+    lifecycle_thread_arg_t *thread_arg = (lifecycle_thread_arg_t *)arg;
+    sensor_mgr_ipc_client_destroy(thread_arg->client);
+    thread_arg->status = SAVVY_OK;
+    return NULL;
+}
+
+static void *send_thread_main(void *arg) {
+    lifecycle_thread_arg_t *thread_arg = (lifecycle_thread_arg_t *)arg;
+    thread_arg->status = sensor_mgr_ipc_client_send(
+        thread_arg->client, SENSOR_MGR_IPC_ACTION_GETSTATE,
+        "{\"SENSOR\":\"PIR\",\"STATE\":\"1\"}");
+    return NULL;
+}
+
+static void test_send_shutdown_race(void) {
+    const int cycles = 250;
+    for (int i = 0; i < cycles; i++) {
+        fake_connector_ctx_t connector_ctx;
+        assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+        test_recorder_t recorder;
+        recorder_init(&recorder);
+        sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+        /* Keep the stress focused on send/close ownership rather than the
+         * intentionally bounded recv poll; each shutdown still traverses
+         * the same state_lock -> io_lock path. */
+        config.recv_poll_timeout_ms = 5;
+        sensor_mgr_ipc_client_t *client = NULL;
+        assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+        assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
+        int mgr_fd = fake_mgr_dequeue_fd(&connector_ctx);
+        assert(mgr_fd >= 0);
+        char buf[256];
+        size_t len = 0;
+        assert(fake_mgr_recv(mgr_fd, buf, sizeof(buf), &len, 2000));
+
+        lifecycle_thread_arg_t send_arg = {client, SAVVY_ERR_UNKNOWN};
+        lifecycle_thread_arg_t shutdown_arg = {client, SAVVY_ERR_UNKNOWN};
+        pthread_t send_thread;
+        pthread_t shutdown_thread;
+        assert(pthread_create(&send_thread, NULL, send_thread_main, &send_arg) == 0);
+        if ((i % 2) == 0) {
+            assert(pthread_create(&shutdown_thread, NULL, stop_thread_main, &shutdown_arg) == 0);
+        } else {
+            assert(pthread_create(&shutdown_thread, NULL, destroy_thread_main, &shutdown_arg) == 0);
+        }
+        pthread_join(send_thread, NULL);
+        pthread_join(shutdown_thread, NULL);
+        assert(send_arg.status == SAVVY_OK || send_arg.status == SAVVY_ERR_NOT_CONNECTED ||
+               send_arg.status == SAVVY_ERR_CLOSED || send_arg.status == SAVVY_ERR_INVALID_ARGUMENT);
+
+        fake_mgr_close(mgr_fd);
+        if ((i % 2) == 0) {
+            sensor_mgr_ipc_client_destroy(client);
+        }
+        fake_connector_destroy(&connector_ctx);
+    }
+}
+
+static void test_concurrent_stop_destroy_stress(void) {
+    for (int i = 0; i < 100; i++) {
+        fake_connector_ctx_t connector_ctx;
+        assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+        test_recorder_t recorder;
+        recorder_init(&recorder);
+        sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+        sensor_mgr_ipc_client_t *client = NULL;
+        assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+
+        lifecycle_thread_arg_t first = {client, SAVVY_ERR_UNKNOWN};
+        lifecycle_thread_arg_t second = {client, SAVVY_ERR_UNKNOWN};
+        pthread_t first_thread;
+        pthread_t second_thread;
+        if ((i % 3) == 0) {
+            assert(pthread_create(&first_thread, NULL, stop_thread_main, &first) == 0);
+            assert(pthread_create(&second_thread, NULL, stop_thread_main, &second) == 0);
+            pthread_join(first_thread, NULL);
+            pthread_join(second_thread, NULL);
+            assert(first.status == SAVVY_OK && second.status == SAVVY_OK);
+            sensor_mgr_ipc_client_destroy(client);
+        } else if ((i % 3) == 1) {
+            assert(pthread_create(&first_thread, NULL, stop_thread_main, &first) == 0);
+            assert(pthread_create(&second_thread, NULL, destroy_thread_main, &second) == 0);
+            pthread_join(first_thread, NULL);
+            pthread_join(second_thread, NULL);
+            assert(first.status == SAVVY_OK || first.status == SAVVY_ERR_INVALID_ARGUMENT);
+        } else {
+            assert(pthread_create(&first_thread, NULL, destroy_thread_main, &first) == 0);
+            assert(pthread_create(&second_thread, NULL, destroy_thread_main, &second) == 0);
+            pthread_join(first_thread, NULL);
+            pthread_join(second_thread, NULL);
+        }
+        fake_connector_destroy(&connector_ctx);
+    }
+}
+
+static void test_callback_lifecycle_operations(void) {
+    for (int action = 1; action <= 2; action++) {
+        fake_connector_ctx_t connector_ctx;
+        assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+        test_recorder_t recorder;
+        recorder_init(&recorder);
+        sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+        sensor_mgr_ipc_client_t *client = NULL;
+        assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+        recorder.callback_client = client;
+        recorder.callback_lifecycle_action = action;
+        assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
+
+        int mgr_fd = fake_mgr_dequeue_fd(&connector_ctx);
+        assert(mgr_fd >= 0);
+        char buf[256];
+        size_t len = 0;
+        assert(fake_mgr_recv(mgr_fd, buf, sizeof(buf), &len, 2000));
+        assert(len > 0);
+        fake_mgr_close(mgr_fd);
+        sleep_ms_test(100);
+
+        if (action == 1) {
+            sensor_mgr_ipc_client_destroy(client);
+        }
+        /* action == 2 has already deferred and completed destroy on the
+         * worker; do not dereference client again. */
+        sleep_ms_test(50);
+        fake_connector_destroy(&connector_ctx);
+    }
 }
 
 static void test_007_shutdown_wakes_blocked_operations(void) {
@@ -358,6 +652,58 @@ static void test_007_shutdown_wakes_blocked_operations(void) {
         fake_connector_destroy(&connector_ctx);
     }
 
+    /* Case C: destroy itself owns the blocked-connect shutdown, so no
+     * caller may race a free against cancel-source/worker teardown. */
+    {
+        fake_connector_ctx_t connector_ctx;
+        assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+        connector_ctx.fail_all = true;
+        test_recorder_t recorder;
+        recorder_init(&recorder);
+        sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+        config.connect_timeout_ms = 5000;
+        sensor_mgr_ipc_client_t *client = NULL;
+        assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+        assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
+        sleep_ms_test(50);
+        lifecycle_thread_arg_t destroy_arg = {client, SAVVY_ERR_UNKNOWN};
+        pthread_t destroy_thread;
+        assert(pthread_create(&destroy_thread, NULL, destroy_thread_main, &destroy_arg) == 0);
+        pthread_join(destroy_thread, NULL);
+        fake_connector_destroy(&connector_ctx);
+    }
+
+    /* Case D: destroy while the worker is inside its bounded recv poll. */
+    {
+        fake_connector_ctx_t connector_ctx;
+        assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+        test_recorder_t recorder;
+        recorder_init(&recorder);
+        sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+        config.recv_poll_timeout_ms = 150;
+        sensor_mgr_ipc_client_t *client = NULL;
+        assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+        assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
+        int mgr_fd = fake_mgr_dequeue_fd(&connector_ctx);
+        assert(mgr_fd >= 0);
+        char buf[256];
+        size_t len = 0;
+        assert(fake_mgr_recv(mgr_fd, buf, sizeof(buf), &len, 2000));
+
+        lifecycle_thread_arg_t destroy_arg = {client, SAVVY_ERR_UNKNOWN};
+        pthread_t destroy_thread;
+        int64_t t0 = now_ms_test();
+        assert(pthread_create(&destroy_thread, NULL, destroy_thread_main, &destroy_arg) == 0);
+        pthread_join(destroy_thread, NULL);
+        assert(now_ms_test() - t0 < 1000);
+        fake_mgr_close(mgr_fd);
+        fake_connector_destroy(&connector_ctx);
+    }
+
+    test_concurrent_stop_destroy_stress();
+    test_send_shutdown_race();
+    test_callback_lifecycle_operations();
+
     printf("SNS-CORE-007(mgr_ipc): OK\n");
 }
 
@@ -373,6 +719,9 @@ int main(int argc, char **argv) {
         test_003b_repeated_drop_is_safe();
     } else if (strcmp(argv[1], "ct-ipc-002") == 0) {
         test_ct_ipc_002_reconnect();
+        test_connect_handshake_failures();
+        test_application_message_size_boundaries();
+        test_inbound_rejection_and_oversize_recovery();
     } else if (strcmp(argv[1], "006") == 0) {
         test_006_repeated_connect_disconnect();
     } else if (strcmp(argv[1], "007") == 0) {

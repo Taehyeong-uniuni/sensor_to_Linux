@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include "mgr_ipc_client.h"
 #include "savvy/core/queue.h"
@@ -24,10 +25,16 @@
 typedef struct fake_connector_ctx {
     savvy_queue_t mgr_fd_queue; /* int items; producer = fake_connector_connect(), consumer = the test's own "fake MGR" driver thread */
     bool fail_all;              /* true => every call simulates "server not reachable yet" (SAVVY_ERR_TIMEOUT), no socketpair created */
+    pthread_mutex_t lock;
+    size_t send_failures_remaining;
+    savvy_status_t send_failure_status;
+    int close_count;
 } fake_connector_ctx_t;
 
 savvy_status_t fake_connector_init(fake_connector_ctx_t *ctx, size_t queue_capacity);
 void fake_connector_destroy(fake_connector_ctx_t *ctx);
+void fake_connector_fail_next_sends(fake_connector_ctx_t *ctx, size_t count, savvy_status_t status);
+int fake_connector_close_count(fake_connector_ctx_t *ctx);
 
 /* sensor_mgr_ipc_connector_fn-compatible. */
 savvy_status_t fake_connector_connect(void *connector_ctx, uint32_t timeout_ms,

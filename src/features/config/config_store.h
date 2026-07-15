@@ -18,12 +18,10 @@ extern "C" {
  * mirroring Android MainActivity.setJsonConfigDto()/actionConfig() (pinned
  * savvy_sensor@48e2d1442cd867cc60f8ff3186d53fce1c08f308).
  *
- * `working` holds the mutable "current" value that each parse merges onto
- * (Foundation's savvy_config_parse leaves *out unchanged for any key
- * missing from the JSON - it is not a fresh-zeroed struct per call). Each
- * successful apply clones `working` into a new heap payload and publishes
- * it; `snapshot` never aliases `working`'s address, since a reader may
- * still hold an older handle while the next apply mutates `working`. */
+ * `working` is used only for old-vs-new reaction diffs. Each successful
+ * parse starts from Foundation defaults, then publishes one heap payload
+ * containing both the typed Config and the exact input JSON. A reader must
+ * retain its snapshot handle while using either accessor. */
 typedef struct sensor_config_store {
     savvy_snapshot_owner_t snapshot;
     pthread_mutex_t write_lock;
@@ -61,12 +59,12 @@ savvy_status_t sensor_config_store_load_cached(sensor_config_store_t *store,
                                                 const char *cached_json,
                                                 size_t cached_len);
 
-/* Runtime path - mirrors Android actionConfig(): parses `json` onto the
- * CURRENT working value (missing keys retain their existing value, same
- * as Foundation's parse contract), diffs old vs new for this session's
- * two owned reactions, and only commits + republishes on SAVVY_OK. A
- * rejected parse (malformed/oversized/duplicate-key/etc, S-003) leaves
- * `store` and *out_result untouched - never partially applied. */
+/* Runtime path - mirrors Android actionConfig(): creates a fresh
+ * Foundation-default Config for every `json`, so omitted fields reset to
+ * Android/Foundation defaults rather than retaining prior live values.
+ * Typed snapshot and byte-exact raw JSON are published together only on
+ * SAVVY_OK. A rejected parse leaves both previous values and *out_result
+ * untouched. */
 savvy_status_t sensor_config_store_apply_runtime(sensor_config_store_t *store,
                                                   const char *json, size_t len,
                                                   sensor_config_apply_result_t *out_result);
@@ -75,6 +73,10 @@ savvy_status_t sensor_config_store_apply_runtime(sensor_config_store_t *store,
  * Returns NULL from acquire if load_cached() has never been called. */
 savvy_snapshot_handle_t *sensor_config_store_acquire(sensor_config_store_t *store, uint64_t *out_version);
 const savvy_config_t *sensor_config_snapshot_payload(savvy_snapshot_handle_t *handle);
+/* Returns the exact successful JSON bytes and length paired with this
+ * handle's typed Config. The returned pointer remains valid only until the
+ * corresponding sensor_config_store_release(). */
+const char *sensor_config_snapshot_raw_json(savvy_snapshot_handle_t *handle, size_t *out_len);
 void sensor_config_store_release(sensor_config_store_t *store, savvy_snapshot_handle_t *handle);
 
 #ifdef __cplusplus

@@ -106,33 +106,19 @@ savvy_status_t sensor_mgr_ipc_client_send(sensor_mgr_ipc_client_t *client,
 
 bool sensor_mgr_ipc_client_is_connected(sensor_mgr_ipc_client_t *client);
 
-/* Idempotent 7-step cancel/destroy sequence (a call while already
-   stopped, or never started, is a safe no-op):
-     1. block new cancel callers (a lifecycle_lock-guarded "stopped" flag
-        - only the first caller proceeds past it)
-     2. join any thread that could itself call cancel (this design has
-        exactly one - the caller of stop() itself - so there is none to
-        join here beyond that)
-     3. execute cancel (savvy_ipc_cancel_source_cancel), after having
-        already set the shutdown flag the recv loop polls
-     4. this wakes a blocked connector waiter immediately, and a blocked
-        recv() within one recv_poll_timeout_ms (recv() takes no cancel
-        source of its own - bounded polling is the only interruption
-        mechanism Foundation's transport interface offers)
-     5. pthread_join the single worker thread - the only waiter/worker in
-        this design - before touching anything it might still be using
-     6. close the transport if still marked connected (the worker thread
-        already closes its own transport on every exit path; this is an
-        idempotent defensive double-check, now safe because step 5 has
-        completed)
-     7. destroy the cancel source, only now that the sole waiter (step 5)
-        has fully joined, matching savvy_ipc_cancel_source_destroy()'s
-        documented precondition */
+/* Thread-safe and idempotent. Concurrent stop callers serialize one
+ * cancellation, worker join, transport close and cancel-source destroy.
+ * A callback running on the worker may call stop(); that path detaches the
+ * self worker and lets it perform terminal cleanup after its callback
+ * stack returns, never self-joining. */
 savvy_status_t sensor_mgr_ipc_client_stop(sensor_mgr_ipc_client_t *client);
 
-/* Calls stop() first (idempotent, so a no-op if already stopped) as a
-   safety net against a caller forgetting to stop before destroying, then
-   frees all resources. */
+/* Thread-safe with stop() and itself. API calls pin a registered client
+ * before dereferencing it; the owning destroy waits existing calls and the
+ * worker before freeing resources. A destroy called from an IPC callback is
+ * deferred to that worker's terminal path, so callback return never touches
+ * freed storage. Calls made after destroy has claimed the client are safely
+ * rejected/no-op. */
 void sensor_mgr_ipc_client_destroy(sensor_mgr_ipc_client_t *client);
 
 /* Sensor->MGR action strings (contracts/ipc_action_catalog.md; MSG_CMD.

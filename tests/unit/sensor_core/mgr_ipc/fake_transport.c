@@ -76,9 +76,23 @@ static bool write_all(int fd, const void *buf, size_t n) {
     return true;
 }
 
+typedef struct fake_transport_impl {
+    int fd;
+    fake_connector_ctx_t *ctx;
+} fake_transport_impl_t;
+
 static savvy_status_t fd_transport_send(savvy_ipc_transport_t *self, const void *buf, size_t len, uint32_t timeout_ms) {
     (void)timeout_ms;
-    int fd = (int)(intptr_t)self->impl;
+    fake_transport_impl_t *impl = (fake_transport_impl_t *)self->impl;
+    int fd = impl->fd;
+    pthread_mutex_lock(&impl->ctx->lock);
+    if (impl->ctx->send_failures_remaining > 0) {
+        impl->ctx->send_failures_remaining -= 1;
+        savvy_status_t status = impl->ctx->send_failure_status;
+        pthread_mutex_unlock(&impl->ctx->lock);
+        return status;
+    }
+    pthread_mutex_unlock(&impl->ctx->lock);
     uint32_t be_len = (uint32_t)len;
     unsigned char prefix[4];
     prefix[0] = (unsigned char)((be_len >> 24) & 0xFF);
@@ -97,7 +111,8 @@ static savvy_status_t fd_transport_send(savvy_ipc_transport_t *self, const void 
 
 static savvy_status_t fd_transport_recv(savvy_ipc_transport_t *self, void *buf, size_t cap, size_t *out_len,
                                         uint32_t timeout_ms) {
-    int fd = (int)(intptr_t)self->impl;
+    fake_transport_impl_t *impl = (fake_transport_impl_t *)self->impl;
+    int fd = impl->fd;
     int64_t deadline = now_ms() + (int64_t)timeout_ms;
 
     unsigned char prefix[4];
@@ -143,22 +158,52 @@ static savvy_status_t fd_transport_recv(savvy_ipc_transport_t *self, void *buf, 
 }
 
 static void fd_transport_close(savvy_ipc_transport_t *self) {
-    int fd = (int)(intptr_t)self->impl;
+    fake_transport_impl_t *impl = (fake_transport_impl_t *)self->impl;
+    int fd = impl->fd;
     if (fd >= 0) {
         shutdown(fd, SHUT_RDWR);
         close(fd);
     }
-    self->impl = (void *)(intptr_t)-1;
+    pthread_mutex_lock(&impl->ctx->lock);
+    impl->ctx->close_count += 1;
+    pthread_mutex_unlock(&impl->ctx->lock);
+    free(impl);
+    self->impl = NULL;
 }
 
 savvy_status_t fake_connector_init(fake_connector_ctx_t *ctx, size_t queue_capacity) {
     ctx->fail_all = false;
-    return savvy_queue_init(&ctx->mgr_fd_queue, queue_capacity, sizeof(int), NULL);
+    ctx->send_failures_remaining = 0;
+    ctx->send_failure_status = SAVVY_ERR_IO;
+    ctx->close_count = 0;
+    if (pthread_mutex_init(&ctx->lock, NULL) != 0) {
+        return SAVVY_ERR_UNKNOWN;
+    }
+    savvy_status_t st = savvy_queue_init(&ctx->mgr_fd_queue, queue_capacity, sizeof(int), NULL);
+    if (st != SAVVY_OK) {
+        pthread_mutex_destroy(&ctx->lock);
+    }
+    return st;
 }
 
 void fake_connector_destroy(fake_connector_ctx_t *ctx) {
     savvy_queue_close(&ctx->mgr_fd_queue);
     savvy_queue_destroy(&ctx->mgr_fd_queue);
+    pthread_mutex_destroy(&ctx->lock);
+}
+
+void fake_connector_fail_next_sends(fake_connector_ctx_t *ctx, size_t count, savvy_status_t status) {
+    pthread_mutex_lock(&ctx->lock);
+    ctx->send_failures_remaining = count;
+    ctx->send_failure_status = status;
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+int fake_connector_close_count(fake_connector_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    int count = ctx->close_count;
+    pthread_mutex_unlock(&ctx->lock);
+    return count;
 }
 
 savvy_status_t fake_connector_connect(void *connector_ctx, uint32_t timeout_ms,
@@ -192,10 +237,20 @@ savvy_status_t fake_connector_connect(void *connector_ctx, uint32_t timeout_ms,
         return SAVVY_ERR_IO;
     }
 
+    fake_transport_impl_t *impl = malloc(sizeof(*impl));
+    if (impl == NULL) {
+        shutdown(fds[0], SHUT_RDWR);
+        close(fds[0]);
+        shutdown(fds[1], SHUT_RDWR);
+        close(fds[1]);
+        return SAVVY_ERR_OUT_OF_MEMORY;
+    }
+    impl->fd = fds[0];
+    impl->ctx = ctx;
     out_transport->send = fd_transport_send;
     out_transport->recv = fd_transport_recv;
     out_transport->close = fd_transport_close;
-    out_transport->impl = (void *)(intptr_t)fds[0];
+    out_transport->impl = impl;
 
     int mgr_fd = fds[1];
     savvy_status_t st = savvy_queue_push(&ctx->mgr_fd_queue, &mgr_fd);
@@ -204,6 +259,7 @@ savvy_status_t fake_connector_connect(void *connector_ctx, uint32_t timeout_ms,
         close(fds[0]);
         shutdown(fds[1], SHUT_RDWR);
         close(fds[1]);
+        free(impl);
         return SAVVY_ERR_IO;
     }
     return SAVVY_OK;

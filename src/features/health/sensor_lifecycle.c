@@ -2,6 +2,25 @@
 
 #include <string.h>
 
+/* A fan-out always uses a value snapshot. Registration performed by a
+ * callback therefore affects the next notification, never the one already
+ * being dispatched. No callback runs with registry_lock held. */
+static size_t snapshot_modules(sensor_lifecycle_t *lc,
+                               sensor_lifecycle_hooks_t snapshot[SENSOR_LIFECYCLE_MAX_MODULES]) {
+    pthread_mutex_lock(&lc->registry_lock);
+    size_t count = lc->module_count;
+    memcpy(snapshot, lc->modules, count * sizeof(snapshot[0]));
+    lc->callback_depth += 1;
+    pthread_mutex_unlock(&lc->registry_lock);
+    return count;
+}
+
+static void finish_module_snapshot(sensor_lifecycle_t *lc) {
+    pthread_mutex_lock(&lc->registry_lock);
+    lc->callback_depth -= 1;
+    pthread_mutex_unlock(&lc->registry_lock);
+}
+
 savvy_status_t sensor_lifecycle_init(sensor_lifecycle_t *lc) {
     if (lc == NULL) {
         return SAVVY_ERR_INVALID_ARGUMENT;
@@ -25,6 +44,15 @@ void sensor_lifecycle_destroy(sensor_lifecycle_t *lc) {
     if (lc == NULL) {
         return;
     }
+    pthread_mutex_lock(&lc->registry_lock);
+    /* The public destroy API has no error return. Refuse a callback's
+     * reentrant destroy rather than invalidating the snapshot currently on
+     * that callback's stack; its owner can destroy after fan-out returns. */
+    if (lc->callback_depth != 0) {
+        pthread_mutex_unlock(&lc->registry_lock);
+        return;
+    }
+    pthread_mutex_unlock(&lc->registry_lock);
     pthread_mutex_destroy(&lc->registry_lock);
     savvy_lifecycle_destroy(&lc->base);
 }
@@ -60,13 +88,14 @@ savvy_status_t sensor_lifecycle_start(sensor_lifecycle_t *lc) {
         return st;
     }
 
-    pthread_mutex_lock(&lc->registry_lock);
-    for (size_t i = 0; i < lc->module_count; i++) {
-        if (lc->modules[i].on_start != NULL) {
-            lc->modules[i].on_start(lc->modules[i].user_data);
+    sensor_lifecycle_hooks_t snapshot[SENSOR_LIFECYCLE_MAX_MODULES];
+    size_t count = snapshot_modules(lc, snapshot);
+    for (size_t i = 0; i < count; i++) {
+        if (snapshot[i].on_start != NULL) {
+            snapshot[i].on_start(snapshot[i].user_data);
         }
     }
-    pthread_mutex_unlock(&lc->registry_lock);
+    finish_module_snapshot(lc);
 
     return SAVVY_OK;
 }
@@ -76,13 +105,14 @@ void sensor_lifecycle_notify_config_applied(sensor_lifecycle_t *lc) {
         return;
     }
 
-    pthread_mutex_lock(&lc->registry_lock);
-    for (size_t i = 0; i < lc->module_count; i++) {
-        if (lc->modules[i].on_config_applied != NULL) {
-            lc->modules[i].on_config_applied(lc->modules[i].user_data);
+    sensor_lifecycle_hooks_t snapshot[SENSOR_LIFECYCLE_MAX_MODULES];
+    size_t count = snapshot_modules(lc, snapshot);
+    for (size_t i = 0; i < count; i++) {
+        if (snapshot[i].on_config_applied != NULL) {
+            snapshot[i].on_config_applied(snapshot[i].user_data);
         }
     }
-    pthread_mutex_unlock(&lc->registry_lock);
+    finish_module_snapshot(lc);
 }
 
 savvy_status_t sensor_lifecycle_stop(sensor_lifecycle_t *lc) {
@@ -96,13 +126,14 @@ savvy_status_t sensor_lifecycle_stop(sensor_lifecycle_t *lc) {
         return st;
     }
 
-    pthread_mutex_lock(&lc->registry_lock);
-    for (size_t i = 0; i < lc->module_count; i++) {
-        if (lc->modules[i].on_shutdown != NULL) {
-            lc->modules[i].on_shutdown(lc->modules[i].user_data);
+    sensor_lifecycle_hooks_t snapshot[SENSOR_LIFECYCLE_MAX_MODULES];
+    size_t count = snapshot_modules(lc, snapshot);
+    for (size_t i = 0; i < count; i++) {
+        if (snapshot[i].on_shutdown != NULL) {
+            snapshot[i].on_shutdown(snapshot[i].user_data);
         }
     }
-    pthread_mutex_unlock(&lc->registry_lock);
+    finish_module_snapshot(lc);
 
     return SAVVY_OK;
 }
