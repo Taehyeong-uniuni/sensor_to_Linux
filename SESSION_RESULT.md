@@ -1,19 +1,107 @@
 # SESSION_RESULT
 
-- SESSION_ID: `CC-FOUNDATION` (this document covers the initial Foundation implementation and three subsequent Codex fix rounds, all on the same branch)
+- SESSION_ID: `CC-FOUNDATION` (this document covers the initial Foundation implementation and four subsequent Codex fix rounds, all on the same branch)
 - Repository: `sensor_to_Linux`
 - Branch: `foundation/contract-v1`
 - Base SHA: `f476aea1ce2674e1a1a791154b2e830cbb87940b` (pinned, gate-verified before branch creation)
-- **Pre-this-round HEAD**: `fc0aa62a585d123a7b0169df959c8935df29d05b` (final HEAD of the prior V0R-H-01/F-07/V0B-H-02/F-08 round)
-- **Implementation SHA (this round - FINAL-M-01/FINAL-M-02 - last code/test commit, what was actually built and tested)**: `941545fc2955f1ad5822d20f4a2e226b5251568a`
-- **Report SHA**: not embedded here - this document's own commit necessarily lands *after* the Implementation SHA above, so a SHA claiming to be "this file's own commit" cannot appear inside that same commit's content (Codex V0A F-12; see "F-12 resolution" below for the full explanation). Run `git rev-parse HEAD` on `foundation/contract-v1` for the true current HEAD; it will be exactly one commit past the Implementation SHA above, and that one commit touches only this file (FINAL-L-01's report-only changes).
+- **Pre-this-round HEAD**: `c1fc299eb24cc4cabfcc03dff006a8c071975c97` (final HEAD of the prior FINAL-M-01/FINAL-M-02/FINAL-L-01 round)
+- **Implementation SHA (this round - TC-H-01/TC-M-01/TC-L-01 - last code/test commit, what was actually built and tested)**: `bc89652ae60d4e7ba794e426b3ab7b1713095be6`
+- **Report SHA**: not embedded here - this document's own commit necessarily lands *after* the Implementation SHA above, so a SHA claiming to be "this file's own commit" cannot appear inside that same commit's content (Codex V0A F-12; see "F-12 resolution" below for the full explanation). Run `git rev-parse HEAD` on `foundation/contract-v1` for the true current HEAD; it will be exactly one commit past the Implementation SHA above, and that one commit touches only this file (TC-L-02's report-only changes).
 - Counterpart repo (`mgr_to_Linux`) base SHA: `9ae8b92d327487a3e0bdf0588449744d66b78c4e`
-- Counterpart repo pre-this-round HEAD: `cd13f388d9c57da565d928df88bc0eb7841ae2f7`
-- Counterpart repo Implementation SHA (this round): `d671ed7230533b07230b568ca47842b3efe50e71`
+- Counterpart repo pre-this-round HEAD: `3d893a6588ea768c84e0be632d54f4b8d71b6a8b`
+- Counterpart repo Implementation SHA (this round): `6916bbb0df2426369a5c3e0091cb740cc7606118`
 - Contract version: `1.0.0`
 - Status: `IMPLEMENTATION_FINISHED` / `AWAITING_CODEX_REVIEW` (this session does not claim the Foundation work is finalized, independently verified, or ready for downstream consumption - Codex re-verification and user testing are still outstanding)
 
-## FINAL-M-01 / FINAL-M-02 / FINAL-L-01 fix round (current)
+## TC-H-01 / TC-M-01 / TC-L-01 / TC-L-02 fix round (current)
+
+A further Codex re-verification found a real regression introduced by the
+previous round's own FINAL-M-01 fix (below), a genuine fd-reuse race between
+`cancel()` and `destroy()`, and a documentation inaccuracy - plus asked for the
+governing status of several long-standing items to be corrected (TC-L-02).
+
+- **TC-H-01 (EINTR-after-deadline-expiry busy-retry regression)**: FINAL-M-01's
+  fix (below) removed `savvy_ipc_poll_with_deadline_cancelable()`'s upfront
+  `savvy_deadline_expired()` pre-check ENTIRELY to fix `timeout_ms == 0` - but
+  that pre-check was also the only thing that stopped a sustained `EINTR`
+  storm arriving *after* the absolute deadline had already elapsed, for
+  `timeout_ms > 0`: with it gone, every `EINTR` unconditionally retried
+  (`continue`), regardless of whether the deadline was already past, which
+  could keep the loop retrying indefinitely under sustained signal pressure.
+  **Fix**: a `first_poll_done` flag now exempts ONLY the very first `poll()`
+  call from the expiry check (preserving FINAL-M-01's `timeout_ms == 0` fix -
+  the very first poll always happens); every retry after that first call
+  (i.e. every `EINTR`) checks `savvy_deadline_expired()` first and returns
+  `SAVVY_ERR_TIMEOUT` immediately, without polling again, if the deadline has
+  already elapsed. **Verified deterministically**: real external signal
+  delivery cannot reliably land inside a single `poll(..., 0)` call's
+  sub-microsecond window, so a new test-only fault-injection seam
+  (`savvy_test_poll_override`, `include/savvy/platform/ipc_test_hooks.h`, a
+  single function-pointer indirection around this one call site, `NULL` in
+  every non-test build) lets tests script poll()'s exact return sequence:
+  timeout=0 ready/not-ready both resolve in exactly 1 scripted poll() call;
+  an `EINTR` before the deadline retries and then succeeds (2 calls); an
+  `EINTR` that (via a scripted sleep) occurs strictly after a short deadline
+  has elapsed resolves to `SAVVY_ERR_TIMEOUT` in exactly 1 call (proving no
+  wasted second attempt); and a sustained-EINTR scenario with 30 scripted
+  retries available against a 50ms deadline stops well before exhausting them
+  (bounded call count) and does not meaningfully exceed the requested
+  timeout. All against the SAME shared `ipc_transport_common.c` used by both
+  repos' `recv`/`send`/`accept`/`connect` paths.
+- **TC-M-01 (cancel/destroy fd-reuse race)**: concurrent
+  `savvy_ipc_cancel_source_cancel()` and `savvy_ipc_cancel_source_destroy()`
+  on the same source could race - `destroy()` closes both pipe fds, the OS
+  is free to reuse those exact fd numbers for an unrelated object
+  immediately afterward, and an in-flight `cancel()` could then write its
+  cancel byte into that unrelated fd. Per this round's explicit instruction,
+  no refcounting/generic lifetime framework was added. Instead,
+  `include/savvy/platform/ipc_cancel.h` now states an explicit, documented
+  concurrency contract: cancel+cancel and cancel+waiter concurrency remain
+  supported; cancel+destroy racing is an explicit, undefined, unsupported
+  precondition violation, not a race this API defends against; the required
+  ordering before calling `destroy()` is (1) no new `cancel()` calls will be
+  issued, (2) every thread that might still be calling `cancel()` has been
+  joined, (3) every accept/connect waiter using the source has been joined -
+  only then may `destroy()` run. This ordering was checked against every
+  existing test's own structure (all already comply, by construction - none
+  needed behavior changes). New tests confirm: `destroy()` then `cancel()`
+  (strictly sequential) returns `SAVVY_ERR_INVALID_ARGUMENT`, not a
+  crash; a second, sequential `destroy()` call remains a safe no-op; and the
+  existing ordered-lifecycle tests are annotated as concrete examples of the
+  one supported ordering. No production behavior changed - this finding was
+  entirely a documentation/contract-clarity gap, not a code defect requiring
+  a fix, per the explicit instruction not to build new lifetime machinery.
+- **TC-L-01 (repeated-cancel documentation inaccuracy)**: `ipc_cancel.h`
+  previously claimed repeated `cancel()` calls are "no-ops that skip the
+  write" once a byte is already pending - inaccurate: every call attempts a
+  REAL `write()`, which usually succeeds (a pipe's kernel buffer is normally
+  tens of KB) rather than immediately hitting `EAGAIN`. Corrected to state
+  the actual, safe behavior: every call writes; `EAGAIN`/`EWOULDBLOCK` once
+  the buffer is genuinely full is treated as "already pending" success; and -
+  since nothing in this API ever drains the pipe - a cancelled source must
+  not be reused for a later, unrelated accept/connect attempt (a leftover
+  pending byte would falsely cancel it immediately). Documentation-only, per
+  the explicit instruction not to redesign the behavior.
+- **TC-L-02 (SESSION_RESULT governing-status corrections)**: see "Docker
+  Linux build/test" below (the locally-built image ID is now the closed,
+  approved baseline, not a flagged mismatch), "Blockers and incomplete
+  items" below (the placeholder contract files are reclassified as Wave 1
+  adapter-contract pending scope, no longer listed as a Foundation blocker;
+  RV1106 is explicitly separated from the host/Docker Foundation code Gate
+  as target-validation-pending), and "Pre-tag compatibility evidence" below
+  (the `DataResult` Gson item is now stated explicitly as NOT optional -
+  required before the `contract-v1` tag, currently `NOT_VERIFIABLE`, and
+  separate from this session's own Foundation Linux C code findings).
+
+**This round's build/test verification**: macOS 5/5 (unchanged - this round's
+fixes don't touch anything macOS builds); Docker Linux 9/9 on both repos via
+the official `run-foundation-tests.sh` against the approved image, with the
+new TC-H-01 deterministic fault-injection checks and the TC-M-01
+destroy/cancel-ordering checks folded into the same supplementary
+`CT-IPC-CANCEL` test; the pre-existing timeout-zero matrix (FINAL-M-01's own
+`004H1`-`004H6`) re-verified with no regression.
+
+## FINAL-M-01 / FINAL-M-02 / FINAL-L-01 fix round (prior round, historical)
 
 A final Codex re-verification found two remaining production bugs and asked for
 one report-only cleanup, on top of the V0R-H-01/F-07/V0B-H-02/F-08 round
@@ -92,7 +180,7 @@ own record; later sections give full detail and are cross-referenced by number.
 5. **Android baseline verification method**: no new Android-source research was needed for V0R-H-01's fix itself beyond what Phase 4 already established, but the fix's correctness was independently re-confirmed this round via `git show <pinned-sha>:<path>` against both `savvy_mgr`@`ad83cabe...` and `savvy_sensor`@`48e2d144...` (never the working tree, which remains under the integrity issue documented below) - see "V0R-H-01" under "Findings addressed" for exact citations.
 6. **macOS test command + result**: see "macOS host build/test" below - 5/5 passing (CT-PKT-001~003, CT-JSON-001~002; `test_ipc`/CT-IPC-*/CT-IPC-CANCEL are not built here, `SAVVY_IPC_REAL_TRANSPORT=OFF`).
 7. **Docker test command + result**: see "Docker Linux build/test" below - 9/9 passing (all 8 required + the supplementary CT-IPC-CANCEL).
-8. **Docker image name + Image ID**: `savvy-foundation-test:ubuntu22.04-arm64-v1`, built locally from the user-provided Dockerfile at `SAVVY_migration_control_v1.0/docker/foundation/Dockerfile` as `sha256:73c8a9709607d1910231efb4648510e4d72052072629901fa28fd5c9f39753e7` - **this does not match the Image ID stated in the task prompt** (`sha256:ec199756c978f0ed5ad9e73a9df5b54d7caaaafe2556cb3367dbde96694956f9`); that tag was not present on this machine's Docker daemon (`docker image inspect` returned "No such image" before this round's build), so it was built fresh from the provided Dockerfile rather than reused - flagged, not silently substituted.
+8. **Docker image name + Image ID**: `savvy-foundation-test:ubuntu22.04-arm64-v1`, built locally from the user-provided Dockerfile at `SAVVY_migration_control_v1.0/docker/foundation/Dockerfile` as `sha256:73c8a9709607d1910231efb4648510e4d72052072629901fa28fd5c9f39753e7` - **this did not match the Image ID stated in the original task prompt** (`sha256:ec199756c978f0ed5ad9e73a9df5b54d7caaaafe2556cb3367dbde96694956f9`); that tag was not present on this machine's Docker daemon (`docker image inspect` returned "No such image" before this round's build), so it was built fresh from the provided Dockerfile rather than reused. **Resolved per TC-L-02 (a later round)**: `sha256:73c8a970...` is now the approved, closed local Docker baseline for this project - see "Docker Linux build/test" below, not an open discrepancy anymore.
 9. **CT-PKT result**: 3/3 passing on both platforms, unchanged in substance this round (test_packet.c gained an F-08 fix, see below, but no new packet-contract behavior).
 10. **CT-JSON result**: 2/2 passing on both platforms, unchanged in substance this round (test_json.c gained committed UTF-8 matrix coverage, see F-08 below, but no new JSON-contract behavior).
 11. **CT-IPC result**: 3/3 (CT-IPC-001~003) passing on Docker Linux, plus the new supplementary CT-IPC-CANCEL (9th test) also passing - see "V0B-H-02" below for what CT-IPC-CANCEL covers.
@@ -376,19 +464,21 @@ additional coverage beyond, not a renumbering of, the required `CT-PKT-001~003`/
 
 ## Modified files (this round)
 
-**Current round** (prior HEAD `fc0aa62`..Implementation SHA `941545f`): 3 files
-changed, 271 insertions(+), 17 deletions(-), 1 commit:
+**Current round** (prior HEAD `c1fc299`..Implementation SHA `bc89652`): 5 files
+changed, 416 insertions(+), 33 deletions(-), 1 commit:
 
 ```text
 include/savvy/platform/ipc_cancel.h
+include/savvy/platform/ipc_test_hooks.h            (new)
 src/platform/linux/ipc/ipc_transport_common.c
+src/platform/linux/ipc/ipc_transport_common.h
 tests/contract/test_ipc.c
 ```
 
-All three fall within the Allowed paths list for this round
+All five fall within the Allowed paths list for this round
 (`include/**/platform/**`, `src/platform/linux/ipc/**`, `tests/contract/**`).
 
-Full base..HEAD session total (all rounds): 15 commits, 61 files changed, 9585
+Full base..HEAD session total (all rounds): 17 commits, 62 files changed, 10083
 insertions(+), 0 deletions(-) (`git log --oneline`/`git diff --stat`, run
 directly):
 
@@ -408,13 +498,16 @@ cde953b fix: address Codex V0A/V0B foundation review findings
 c9cd633 fix: remove literal forbidden-status substrings and align resync test data with V0R-H-01
 fc0aa62 docs: record the independent verification pass and final touch-up SHA
 941545f fix: FINAL-M-01 timeout_ms==0 semantics and FINAL-M-02 cancel EINTR handling
+c1fc299 docs: FINAL-M-01/M-02 findings + FINAL-L-01 report-only cleanup
+bc89652 fix: TC-H-01 EINTR-after-deadline regression, TC-M-01/TC-L-01 cancel/destroy contract docs
 ```
 
-The prior round's own file list (17 files, 1112 insertions(+), 58 deletions(-))
-is unchanged from what's recorded further below in the historical 23-item
-section. All paths across every round fall within the Allowed paths list.
-Local `build/` directories and stray `.omc/` framework artifacts (regenerated/
-recreated by tooling, never staged) were removed before this round's commit.
+The prior rounds' own file lists (17 files/1112(+)/58(-), then 3 files/271(+)/
+17(-)) are unchanged from what's recorded further above/below in their own
+historical sections. All paths across every round fall within the Allowed
+paths list. Local `build/` directories and stray `.omc/` framework artifacts
+(regenerated/recreated by tooling, never staged) were removed before this
+round's commit.
 
 ## macOS host build/test
 
@@ -467,20 +560,40 @@ ctest --test-dir <build_path> --output-on-failure
     CT-IPC-001 .......... Passed
     CT-IPC-002 .......... Passed
     CT-IPC-003 .......... Passed
-    CT-IPC-CANCEL ........ Passed  (3.32s, current round - grew from 3.06s as
-                                    this round added the FINAL-M-01 timeout=0
-                                    matrix and FINAL-M-02 EINTR-bombardment
-                                    sub-tests to the same binary; all other
-                                    tests still complete in <0.1s)
+    CT-IPC-CANCEL ........ Passed  (~3.3s, current round - grew slightly as
+                                    this round added the TC-H-01 fault-
+                                    injection checks and the TC-M-01
+                                    destroy/cancel-ordering checks to the
+                                    same binary; all other tests still
+                                    complete in <0.1s)
 ```
 
 `ctest --output-on-failure` only prints a test's stdout when it fails, so a
 passing `CT-IPC-CANCEL` line alone doesn't show each individual `CHECK` inside
-it. Since this round added 8 new checks to it (sensor: `004H1`-`004H6` for
-FINAL-M-01, `004C3` for FINAL-M-02) and their outcome matters for this
-specific report, `test_ipc 004` was also run **standalone**, directly, in a
-throwaway container (same image, same build), to see every line: **36/36
-individual checks passed**, including every `004H*`/`004C3` name explicitly.
+it. Since this round added several new checks to it (sensor: `004J1`-`004J6`
+for TC-H-01, a `004C-lifecycle` block for TC-M-01) and their outcome matters
+for this specific report, `test_ipc 004` was also run **standalone**,
+directly, in a throwaway container (same image, same build), to see every
+line - confirmed across 3 separate standalone runs: **all checks passed every
+time**, including every `004J*`/`004C-lifecycle` name explicitly.
+
+**One real, reproducible flaky failure was found and fixed during this
+round's own verification, specific to this repo.** The first full
+`run-foundation-tests.sh` pass after implementing TC-H-01's tests showed
+`mgr_to_Linux` fully green (9/9) but `sensor_to_Linux` failing exactly one
+check (`004J4`, "EINTR strictly after deadline: exactly 1 poll() call").
+Root cause: the test's own `scripted_poll()` helper used a single,
+non-restarted `nanosleep()` call to simulate a slow EINTR - itself
+interruptible by a stray signal (plausibly residual delivery from an earlier
+sub-test's own signal bombardment), which could return early and undermine
+the timing the test depended on. This was a bug in the **test harness**, not
+in the `ipc_transport_common.c` fix itself (which is byte-identical between
+both repos and had already passed on `mgr_to_Linux` in the same run). Fixed
+by looping `nanosleep()` on its own remaining-time output until the full
+requested duration has genuinely elapsed. Re-verified clean across 3
+consecutive full `run-foundation-tests.sh` passes (both repos, 9/9 each) plus
+3 additional standalone direct executions of the specific previously-failing
+check.
 
 Environment: `savvy-foundation-test:ubuntu22.04-arm64-v1`, GCC 11.4.0, CMake
 3.22.1, Ninja 1.10.1, `linux/arm64`. Full raw logs written to
@@ -489,15 +602,13 @@ docker-sensor-foundation.log` (this repo) and `docker-mgr-foundation.log`
 (counterpart) by the script itself - the pre-existing `-before-v0r-fix.log`
 files were not overwritten (script writes to the plain, non-suffixed names).
 
-One environment note, not a code defect: the specified Docker image
-(`savvy-foundation-test:ubuntu22.04-arm64-v1` @
-`sha256:ec199756c978f0ed5ad9e73a9df5b54d7caaaafe2556cb3367dbde96694956f9`) was
-not present on this machine's Docker daemon at the start of this round -
-`docker image inspect` returned "No such image". Built fresh from the provided
-`Dockerfile` (same path, same contents); the resulting image, same tag, has a
-different content-addressed ID (`sha256:73c8a970...`) since Docker image IDs
-depend on exact build-time package resolution, not just Dockerfile text. Both
-repos' full 9/9 pass under this locally-built image.
+**TC-L-02: Docker image ID - closed baseline.** `savvy-foundation-test:ubuntu22.04-arm64-v1`
+@ `sha256:73c8a9709607d1910231efb4648510e4d72052072629901fa28fd5c9f39753e7`
+(built locally from the provided `Dockerfile` after an earlier round found a
+different, previously-stated Image ID absent from this machine's Docker
+daemon) is now the **approved, closed local Docker baseline** for this
+project - not an open discrepancy to keep flagging. Both repos' full 9/9 pass
+under this exact image.
 
 ## Contract manifest comparison
 
@@ -573,12 +684,23 @@ integrity (see the dedicated section near the top of this document) and the
 `keepServerIp` per-application divergence (now recorded as an approved design
 decision, see "Approved: keepServerIp divergence" below, not an open question).
 
-1. **RV1106 cross-build**: `PENDING`, blocked on B-005, out of this session's scope.
+Per TC-L-02 (this round), two further items are removed/reclassified: the
+Docker Image ID discrepancy is now a closed, approved baseline (see "Docker
+Linux build/test" above), not a blocker; and `contracts/bt_spp.md`/`tcp_8140.md`
+are reclassified below as Wave 1 adapter-contract pending scope, not a
+Foundation Gate blocker.
+
+1. **RV1106 cross-build**: `TARGET_VALIDATION_PENDING`, blocked on B-005 - explicitly separated from, and not part of, this session's host/Docker Foundation code Gate (TC-L-02).
 2. **`SO_PEERCRED`/production socket path**: explicitly `DEFERRED_PRODUCTION_SECURITY` per DEC-20260714-02.
 3. **`getBytesAsLen()` serial-overflow bug**: unchanged from prior rounds - Android-side risk, FND-01 deliberately does not reproduce it, not fixed here since FND-01 never implements a concrete serial provider.
-4. **`contracts/bt_spp.md`/`tcp_8140.md`**: remain 0-byte placeholders, out of FND-01~04 scope.
-5. No `CONTRACT_CHANGE_REQUEST` filed - none of this round's fixes altered the wire contract.
-6. **New this round, informational**: the Docker image built locally does not match the Image ID stated in the task prompt (see "Docker Linux build/test" above) - the specified tag was not present on this machine; verification proceeded against a freshly-built image from the same provided Dockerfile instead.
+4. No `CONTRACT_CHANGE_REQUEST` filed - none of this round's fixes altered the wire contract.
+
+**`contracts/bt_spp.md`/`tcp_8140.md`** (TC-L-02, no longer listed as a
+blocker): these remain 0-byte placeholders, but are reclassified as **Wave 1
+adapter-contract pending scope** - filling in the actual TCP-8140/BT-SPP wire
+contracts is CC-MGR-CONNECTIVITY/CC-MGR-SERVER's objective, not an
+independent Foundation Gate blocker; FND-01~04 never had a deliverable that
+depended on their content.
 
 See also "Pre-tag compatibility evidence" below for the `DataResult` Gson item,
 which remains open (not resolved) but is tracked separately from "Blockers"
@@ -593,19 +715,27 @@ full history and citations). This is the **approved** per-application Android
 baseline - the two values are not a unification target, this is not an open
 `SCOPE_CHANGE_REQUEST` decision, and this item does not block anything.
 
-## Pre-tag compatibility evidence (open, not recorded as resolved)
+## Pre-tag compatibility evidence (NOT optional - required before contract-v1)
 
-`DataResult`'s Gson-unsafe-allocation risk - a missing `"result"` key could
-plausibly deserialize to `0` (danger) rather than the `4` (normal) field
-initializer on real Android, since a class with no no-arg constructor forces
-Gson 2.8.2 into unsafe/no-constructor allocation, which bypasses field
-initializers - has **not** been independently verified by executing real
-Android/Gson bytecode. This remains open and is deliberately kept out of
-"Blockers" above (it does not block this session's own completion: CT-JSON-002
-already specifies, and this codebase already implements, the safer of the two
-candidate behaviors regardless of which one Gson actually exhibits) - but it is
-explicitly **not recorded as resolved**, and should be tracked as outstanding
-pre-tag compatibility evidence for whoever owns the `contract-v1` tag decision.
+**TC-L-02: `DataResult` Gson 2.8.2 compatibility evidence is NOT optional.**
+Status: **`NOT_VERIFIABLE`** (not "resolved," not "optional," not "nice to
+have"). It is **required to be confirmed before the `contract-v1` tag is
+created** - a separate, empirical, pre-tag gate, distinct from and additional
+to this session's own Foundation Linux C code findings/fixes.
+
+The risk: a missing `"result"` key could plausibly deserialize to `0`
+(danger) rather than the `4` (normal) field initializer on real Android,
+since a class with no no-arg constructor forces Gson 2.8.2 into unsafe/
+no-constructor allocation, which bypasses field initializers. This has
+**not** been independently verified by executing real Android/Gson bytecode
+in this or any prior round - hence `NOT_VERIFIABLE` as of this document, not
+a claim that it is fine. It is deliberately kept out of "Blockers" above only
+in the narrow sense that it does not block *this session's own* completion
+(CT-JSON-002 already specifies, and this codebase already implements, the
+safer of the two candidate behaviors regardless of which one Gson actually
+exhibits) - it is very much a blocker on the `contract-v1` tag decision
+itself, which is a separate gate owned by whoever makes that call, not by
+this Foundation code session.
 
 ## Contract change
 
@@ -624,9 +754,9 @@ None. No wire contract, envelope schema, or field policy was modified this round
 
 ## Next dependency / handoff
 
-- Codex re-verification of this round's fixes (V0R-H-01, F-07, V0B-H-02, F-08, and the FINAL-M-01/FINAL-M-02/FINAL-L-01 follow-ups).
+- Codex re-verification of this round's fixes (TC-H-01, TC-M-01, TC-L-01, TC-L-02, and all prior rounds' V0R-H-01/F-07/V0B-H-02/F-08/FINAL-M-01/FINAL-M-02/FINAL-L-01 fixes).
 - User review and Gate approval; `contract-v1` tag creation happens only after that.
 - Android baseline integrity recovery (see the dedicated section above) - a real, separate, unresolved audit item, tracked independently of this Foundation session's own completion (per FINAL-L-01, not a blocker on it).
-- `DataResult`'s Gson deserialization behavior - optional empirical verification on a real device/emulator before `contract-v1` is tagged (see "Pre-tag compatibility evidence" above; not resolved, not blocking).
-- B-005 (RV1106 SDK/toolchain) resolution, whenever cross-build work is scheduled.
-- Wave 1 sessions (`CC-SENSOR-CORE`, `CC-SENSOR-STREAM`, and `CC-MGR-CORE`/`CC-MGR-SERVER` in the counterpart repo) can consume the FND-01~04 headers/codecs, including the new `savvy_ipc_reconnect_tracker_t` hook and `savvy_ipc_cancel_source_t` cancellation primitive, committed here.
+- **Required, not optional (TC-L-02)**: empirical verification of `DataResult`'s actual Gson 2.8.2 deserialization behavior on a real device/emulator, before `contract-v1` is tagged - see "Pre-tag compatibility evidence" above (`NOT_VERIFIABLE`, required before tag).
+- B-005 (RV1106 SDK/toolchain) resolution, whenever cross-build work is scheduled - target-validation-pending, separate from this session's own Gate (TC-L-02).
+- Wave 1 sessions (`CC-SENSOR-CORE`, `CC-SENSOR-STREAM`, and `CC-MGR-CORE`/`CC-MGR-SERVER` in the counterpart repo) can consume the FND-01~04 headers/codecs, including the new `savvy_ipc_reconnect_tracker_t` hook and `savvy_ipc_cancel_source_t` cancellation primitive, committed here. Wave 1's TCP-8140/BT-SPP adapter contract work (CC-MGR-CONNECTIVITY/CC-MGR-SERVER) is what will fill in `contracts/bt_spp.md`/`tcp_8140.md` (TC-L-02).
