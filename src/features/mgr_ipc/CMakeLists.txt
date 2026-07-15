@@ -107,6 +107,10 @@ if(SAVVY_BUILD_TESTS)
     add_executable(test_sensor_core_mgr_ipc
         ${SAVVY_REPO_ROOT}/tests/unit/sensor_core/mgr_ipc/test_mgr_ipc_client.c
         ${SAVVY_REPO_ROOT}/tests/unit/sensor_core/mgr_ipc/fake_transport.c
+        ${SAVVY_REPO_ROOT}/src/features/state_report/state_report.c
+    )
+    target_include_directories(test_sensor_core_mgr_ipc PRIVATE
+        ${SAVVY_REPO_ROOT}/src/features/state_report
     )
     target_link_libraries(test_sensor_core_mgr_ipc PRIVATE sensor_core_mgr_ipc)
     add_test(NAME SNS-CORE-003a COMMAND test_sensor_core_mgr_ipc 003a)

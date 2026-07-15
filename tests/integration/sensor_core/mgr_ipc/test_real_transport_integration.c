@@ -151,6 +151,22 @@ int main(void) {
 
     sensor_mgr_ipc_client_t *client = NULL;
     assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+
+    /* Prepare actual pre-connect drops. mock_mgr rejects every outbound
+     * message after CONNECT, so its zero exit status directly proves none
+     * of these four records (or cached Config/Device) was replayed. */
+    assert(sensor_mgr_ipc_client_send(
+               client, SENSOR_MGR_IPC_ACTION_GETSTATE,
+               "{\"SENSOR\":\"PIR\",\"STATE\":\"1\"}") == SAVVY_ERR_NOT_CONNECTED);
+    assert(sensor_mgr_ipc_client_send(
+               client, SENSOR_MGR_IPC_ACTION_PROPERTY, "{}") == SAVVY_ERR_NOT_CONNECTED);
+    assert(sensor_mgr_ipc_client_send(
+               client, SENSOR_MGR_IPC_ACTION_ALERT,
+               "{\"IFCOMM_START\":\"1\"}") == SAVVY_ERR_NOT_CONNECTED);
+    assert(sensor_mgr_ipc_client_send(
+               client, SENSOR_MGR_IPC_ACTION_UPLOAD,
+               "{\"targetFilePath\":\"/tmp/preconnect\",\"targetFileNm\":\"preconnect\"}") ==
+           SAVVY_ERR_NOT_CONNECTED);
     assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
 
     assert(wait_until_ge(get_connect_count, &recorder, 1, 5000));

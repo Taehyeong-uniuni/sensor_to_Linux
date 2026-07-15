@@ -107,18 +107,21 @@ savvy_status_t sensor_mgr_ipc_client_send(sensor_mgr_ipc_client_t *client,
 bool sensor_mgr_ipc_client_is_connected(sensor_mgr_ipc_client_t *client);
 
 /* Thread-safe and idempotent. Concurrent stop callers serialize one
- * cancellation, worker join, transport close and cancel-source destroy.
- * A callback running on the worker may call stop(); that path detaches the
- * self worker and lets it perform terminal cleanup after its callback
- * stack returns, never self-joining. */
+ * cancellation and worker join. The worker closes transport and destroys
+ * its cancel source before terminal completion is published. A callback
+ * running on the worker may call stop() without self-joining; that worker
+ * remains joinable and the next external stop/start/destroy completes its
+ * terminal handoff before returning or restarting. */
 savvy_status_t sensor_mgr_ipc_client_stop(sensor_mgr_ipc_client_t *client);
 
 /* Thread-safe with stop() and itself. API calls pin a registered client
  * before dereferencing it; the owning destroy waits existing calls and the
  * worker before freeing resources. A destroy called from an IPC callback is
  * deferred to that worker's terminal path, so callback return never touches
- * freed storage. Calls made after destroy has claimed the client are safely
- * rejected/no-op. */
+ * freed storage. If an external stop already owns the join when callback
+ * destroy races it, the void callback destroy is safely reduced to stop and
+ * a later external destroy owns final storage release. Calls made after an
+ * accepted destroy has claimed the client are safely rejected/no-op. */
 void sensor_mgr_ipc_client_destroy(sensor_mgr_ipc_client_t *client);
 
 /* Sensor->MGR action strings (contracts/ipc_action_catalog.md; MSG_CMD.

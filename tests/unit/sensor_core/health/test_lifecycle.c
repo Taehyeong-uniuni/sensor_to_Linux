@@ -7,6 +7,9 @@
 #include "sensor_health.h"
 #include "sensor_lifecycle.h"
 
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,6 +45,7 @@ typedef struct reentrant_module {
     int extra_config_calls;
     bool registered_extra;
     bool nested_config_sent;
+    bool callback_destroy_attempted;
 } reentrant_module_t;
 
 static void reentrant_extra_config(void *ud) {
@@ -68,6 +72,11 @@ static void reentrant_config(void *ud) {
     }
     if (!m->nested_config_sent) {
         m->nested_config_sent = true;
+        m->callback_destroy_attempted = true;
+        /* The void destroy API deterministically refuses destruction while
+         * a fan-out snapshot is active. The nested notification below must
+         * therefore remain valid and complete normally. */
+        sensor_lifecycle_destroy(m->lc);
         sensor_lifecycle_notify_config_applied(m->lc);
     }
 }
@@ -98,11 +107,40 @@ static void test_reentrant_callbacks_snapshot_policy(void) {
     sensor_lifecycle_notify_config_applied(&lc);
     assert(module.config_calls == 2);
     assert(module.extra_config_calls == 1);
+    assert(module.callback_destroy_attempted);
 
     assert(sensor_lifecycle_stop(&lc) == SAVVY_OK);
     assert(module.shutdown_calls == 1);
     sensor_lifecycle_destroy(&lc);
     printf("SENSOR-CORE-LIFECYCLE-REENTRANT: OK\n");
+}
+
+static void test_poisoned_storage_initialization(void) {
+    for (int i = 0; i < 100; i++) {
+        sensor_lifecycle_t lc;
+        memset(&lc, 0xA5, sizeof(lc));
+        assert(sensor_lifecycle_init(&lc) == SAVVY_OK);
+        assert(lc.callback_depth == 0);
+        assert(lc.module_count == 0);
+
+        reentrant_module_t module = {0};
+        module.lc = &lc;
+        sensor_lifecycle_hooks_t hooks = {
+            "poison-reentrant", reentrant_start, reentrant_config,
+            reentrant_shutdown, &module
+        };
+        assert(sensor_lifecycle_register_module(&lc, &hooks) == SAVVY_OK);
+        assert(sensor_lifecycle_start(&lc) == SAVVY_OK);
+        sensor_lifecycle_notify_config_applied(&lc);
+        assert(module.config_calls == 2);
+        assert(module.extra_config_calls == 1);
+        assert(lc.callback_depth == 0);
+        assert(sensor_lifecycle_stop(&lc) == SAVVY_OK);
+        assert(module.shutdown_calls == 1);
+        assert(lc.callback_depth == 0);
+        sensor_lifecycle_destroy(&lc);
+    }
+    printf("SENSOR-CORE-LIFECYCLE-POISONED-INIT: OK (100 cycles)\n");
 }
 
 static void test_007_shutdown_fanout_and_registration_order(void) {
@@ -219,6 +257,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "007") == 0) {
         test_007_shutdown_fanout_and_registration_order();
         test_reentrant_callbacks_snapshot_policy();
+        test_poisoned_storage_initialization();
     } else if (strcmp(argv[1], "idempotent") == 0) {
         test_idempotent_start_stop();
         test_overflow_rejected();

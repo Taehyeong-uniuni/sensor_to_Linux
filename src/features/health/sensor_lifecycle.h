@@ -66,6 +66,9 @@ typedef struct sensor_lifecycle {
     size_t callback_depth;
 } sensor_lifecycle_t;
 
+/* On failure, module_count/callback_depth and hook storage remain in a
+ * defined zero state, but destroy() is valid only after SAVVY_OK because
+ * the mutex/base primitive may not have completed initialization. */
 savvy_status_t sensor_lifecycle_init(sensor_lifecycle_t *lc);
 void sensor_lifecycle_destroy(sensor_lifecycle_t *lc);
 

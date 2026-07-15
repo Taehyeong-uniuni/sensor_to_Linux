@@ -12,6 +12,14 @@
 #include "savvy/protocol/ipc_action_catalog.h"
 #include "savvy/protocol/ipc_envelope.h"
 
+typedef enum sensor_mgr_ipc_connection_state {
+    SENSOR_MGR_IPC_DISCONNECTED = 0,
+    SENSOR_MGR_IPC_TRANSPORT_CONNECTED,
+    SENSOR_MGR_IPC_HANDSHAKING,
+    SENSOR_MGR_IPC_CONNECTED,
+    SENSOR_MGR_IPC_STOPPING
+} sensor_mgr_ipc_connection_state_t;
+
 struct sensor_mgr_ipc_client {
     sensor_mgr_ipc_config_t config;
 
@@ -24,15 +32,17 @@ struct sensor_mgr_ipc_client {
     pthread_mutex_t state_lock;
     pthread_mutex_t io_lock;
     savvy_ipc_transport_t transport;
-    bool connected;
+    sensor_mgr_ipc_connection_state_t connection_state;
 
     pthread_mutex_t lifecycle_lock;
     pthread_cond_t shutdown_cond;
     bool started;
     bool shutdown_requested;
     bool stop_complete;
+    bool terminal_cleanup_complete;
     bool cancel_initialized;
     bool worker_detached;
+    bool join_in_progress;
     pthread_t worker_thread;
 
     /* The public API is a raw pointer ABI.  A process-lifetime registry
@@ -101,6 +111,21 @@ static bool client_claim_destroy(sensor_mgr_ipc_client_t *client, bool from_work
     return true;
 }
 
+static void client_unclaim_destroy(sensor_mgr_ipc_client_t *client) {
+    pthread_mutex_lock(&g_registry_lock);
+    client->destroy_requested = false;
+    client->destroy_from_worker = false;
+    pthread_cond_broadcast(&g_registry_idle);
+    pthread_mutex_unlock(&g_registry_lock);
+}
+
+static bool client_destroy_is_requested(sensor_mgr_ipc_client_t *client) {
+    pthread_mutex_lock(&g_registry_lock);
+    bool requested = client->destroy_requested;
+    pthread_mutex_unlock(&g_registry_lock);
+    return requested;
+}
+
 static void wait_for_other_api_callers(sensor_mgr_ipc_client_t *client, size_t self_count) {
     pthread_mutex_lock(&g_registry_lock);
     while (client->api_callers > self_count) {
@@ -134,32 +159,50 @@ static bool caller_is_worker(sensor_mgr_ipc_client_t *client) {
 static void close_transport(sensor_mgr_ipc_client_t *client) {
     pthread_mutex_lock(&client->state_lock);
     pthread_mutex_lock(&client->io_lock);
-    if (client->connected) {
+    if (client->connection_state != SENSOR_MGR_IPC_DISCONNECTED) {
         client->transport.close(&client->transport);
-        client->connected = false;
+        memset(&client->transport, 0, sizeof(client->transport));
+        client->connection_state = SENSOR_MGR_IPC_DISCONNECTED;
     }
     pthread_mutex_unlock(&client->io_lock);
     pthread_mutex_unlock(&client->state_lock);
 }
 
+static void mark_transport_stopping(sensor_mgr_ipc_client_t *client) {
+    pthread_mutex_lock(&client->state_lock);
+    if (client->connection_state != SENSOR_MGR_IPC_DISCONNECTED) {
+        client->connection_state = SENSOR_MGR_IPC_STOPPING;
+    }
+    pthread_mutex_unlock(&client->state_lock);
+}
+
 static void worker_mark_finished(sensor_mgr_ipc_client_t *client) {
-    bool worker_owns_cleanup = false;
+    bool destroy_cancel = false;
     bool destroy_after_cleanup = false;
 
     pthread_mutex_lock(&client->lifecycle_lock);
+    if (client->cancel_initialized) {
+        client->cancel_initialized = false;
+        destroy_cancel = true;
+    }
+    pthread_mutex_unlock(&client->lifecycle_lock);
+
+    /* terminal_cleanup_complete and stop_complete must not become visible
+     * until the worker-owned cancel source has actually been destroyed. */
+    if (destroy_cancel) {
+        savvy_ipc_cancel_source_destroy(&client->cancel_source);
+    }
+
+    pthread_mutex_lock(&client->lifecycle_lock);
+    client->terminal_cleanup_complete = true;
     if (client->worker_detached) {
         client->started = false;
         client->stop_complete = true;
-        worker_owns_cleanup = client->cancel_initialized;
-        client->cancel_initialized = false;
     }
     destroy_after_cleanup = client->destroy_from_worker;
     pthread_cond_broadcast(&client->shutdown_cond);
     pthread_mutex_unlock(&client->lifecycle_lock);
 
-    if (worker_owns_cleanup) {
-        savvy_ipc_cancel_source_destroy(&client->cancel_source);
-    }
     if (destroy_after_cleanup) {
         /* A callback-triggered destroy runs on this worker.  It was
          * detached before the callback returned; all future client access
@@ -170,9 +213,7 @@ static void worker_mark_finished(sensor_mgr_ipc_client_t *client) {
 
 static savvy_status_t stop_impl(sensor_mgr_ipc_client_t *client) {
     pthread_t worker;
-    bool self_worker;
     bool do_join = false;
-    bool do_cancel = false;
 
     pthread_mutex_lock(&client->lifecycle_lock);
     if (!client->started) {
@@ -180,28 +221,24 @@ static savvy_status_t stop_impl(sensor_mgr_ipc_client_t *client) {
         return SAVVY_OK;
     }
 
-    self_worker = pthread_equal(pthread_self(), client->worker_thread);
+    bool self_worker = pthread_equal(pthread_self(), client->worker_thread);
     if (!client->shutdown_requested) {
         client->shutdown_requested = true;
         pthread_cond_broadcast(&client->shutdown_cond);
-        worker = client->worker_thread;
-        do_cancel = client->cancel_initialized;
+        if (client->cancel_initialized) {
+            /* lifecycle_lock prevents worker_mark_finished() from claiming
+             * and destroying the cancel source before this cancel call. */
+            savvy_ipc_cancel_source_cancel(&client->cancel_source);
+        }
+    }
 
-        if (self_worker) {
-            /* A worker callback cannot join itself. Detaching makes the
-             * worker's terminal cleanup authoritative and prevents a
-             * joinable-thread resource leak. */
-            (void)pthread_detach(worker);
-            client->worker_detached = true;
-        } else {
-            do_join = true;
-        }
+    if (self_worker) {
         pthread_mutex_unlock(&client->lifecycle_lock);
-    } else {
-        if (self_worker) {
-            pthread_mutex_unlock(&client->lifecycle_lock);
-            return SAVVY_OK;
-        }
+        mark_transport_stopping(client);
+        return SAVVY_OK;
+    }
+
+    if (client->worker_detached) {
         while (!client->stop_complete) {
             pthread_cond_wait(&client->shutdown_cond, &client->lifecycle_lock);
         }
@@ -209,27 +246,36 @@ static savvy_status_t stop_impl(sensor_mgr_ipc_client_t *client) {
         return SAVVY_OK;
     }
 
-    if (do_cancel) {
-        savvy_ipc_cancel_source_cancel(&client->cancel_source);
-    }
-    if (!do_join) {
+    if (client->join_in_progress) {
+        while (!client->stop_complete) {
+            pthread_cond_wait(&client->shutdown_cond, &client->lifecycle_lock);
+        }
+        pthread_mutex_unlock(&client->lifecycle_lock);
         return SAVVY_OK;
     }
 
-    (void)pthread_join(worker, NULL);
-    close_transport(client);
+    client->join_in_progress = true;
+    worker = client->worker_thread;
+    do_join = true;
+    pthread_mutex_unlock(&client->lifecycle_lock);
+    mark_transport_stopping(client);
+
+    if (do_join) {
+        (void)pthread_join(worker, NULL);
+    }
 
     pthread_mutex_lock(&client->lifecycle_lock);
-    bool destroy_cancel = client->cancel_initialized;
-    client->cancel_initialized = false;
+    /* pthread_join proves worker execution, transport cleanup, and cancel
+     * cleanup are all complete before restart/destroy may proceed. */
+    if (!client->terminal_cleanup_complete) {
+        pthread_mutex_unlock(&client->lifecycle_lock);
+        return SAVVY_ERR_UNKNOWN;
+    }
     client->started = false;
     client->stop_complete = true;
+    client->join_in_progress = false;
     pthread_cond_broadcast(&client->shutdown_cond);
     pthread_mutex_unlock(&client->lifecycle_lock);
-
-    if (destroy_cancel) {
-        savvy_ipc_cancel_source_destroy(&client->cancel_source);
-    }
     return SAVVY_OK;
 }
 
@@ -267,8 +313,9 @@ savvy_status_t sensor_mgr_ipc_client_create(sensor_mgr_ipc_client_t **out_client
         return SAVVY_ERR_UNKNOWN;
     }
 
-    client->connected = false;
+    client->connection_state = SENSOR_MGR_IPC_DISCONNECTED;
     client->stop_complete = true;
+    client->terminal_cleanup_complete = true;
     registry_add(client);
     *out_client = client;
     return SAVVY_OK;
@@ -279,13 +326,41 @@ savvy_status_t sensor_mgr_ipc_client_start(sensor_mgr_ipc_client_t *client) {
         return SAVVY_ERR_INVALID_ARGUMENT;
     }
 
+    for (;;) {
+        pthread_mutex_lock(&client->lifecycle_lock);
+        if (client->started && !client->shutdown_requested) {
+            pthread_mutex_unlock(&client->lifecycle_lock);
+            client_leave(client);
+            return SAVVY_OK;
+        }
+        if (!client->started) {
+            pthread_mutex_unlock(&client->lifecycle_lock);
+            break;
+        }
+        bool self_worker = pthread_equal(pthread_self(), client->worker_thread);
+        pthread_mutex_unlock(&client->lifecycle_lock);
+        if (self_worker) {
+            client_leave(client);
+            return SAVVY_ERR_INVALID_ARGUMENT;
+        }
+        savvy_status_t reap_st = stop_impl(client);
+        if (reap_st != SAVVY_OK) {
+            client_leave(client);
+            return reap_st;
+        }
+    }
+
+    if (client_destroy_is_requested(client)) {
+        client_leave(client);
+        return SAVVY_ERR_INVALID_ARGUMENT;
+    }
+
     pthread_mutex_lock(&client->lifecycle_lock);
     if (client->started) {
         pthread_mutex_unlock(&client->lifecycle_lock);
         client_leave(client);
         return SAVVY_OK;
     }
-
     savvy_status_t st = savvy_ipc_cancel_source_init(&client->cancel_source);
     if (st != SAVVY_OK) {
         pthread_mutex_unlock(&client->lifecycle_lock);
@@ -296,7 +371,9 @@ savvy_status_t sensor_mgr_ipc_client_start(sensor_mgr_ipc_client_t *client) {
     savvy_ipc_reconnect_tracker_init(&client->reconnect_tracker);
     client->shutdown_requested = false;
     client->stop_complete = false;
+    client->terminal_cleanup_complete = false;
     client->worker_detached = false;
+    client->join_in_progress = false;
 
     if (pthread_create(&client->worker_thread, NULL, worker_main, client) != 0) {
         client->cancel_initialized = false;
@@ -332,15 +409,19 @@ static savvy_status_t send_impl(sensor_mgr_ipc_client_t *client,
     }
 
     pthread_mutex_lock(&client->state_lock);
-    pthread_mutex_lock(&client->io_lock);
-    if (!client->connected) {
+    if (client->connection_state != SENSOR_MGR_IPC_CONNECTED) {
         st = SAVVY_ERR_NOT_CONNECTED;
+        pthread_mutex_unlock(&client->state_lock);
     } else {
+        pthread_mutex_lock(&client->io_lock);
+        /* Acquisition remains state_lock -> io_lock. Releasing state_lock
+         * before blocking I/O keeps state queries and stop from starving;
+         * io_lock alone pins transport until send returns. */
+        pthread_mutex_unlock(&client->state_lock);
         st = client->transport.send(&client->transport, envelope, envelope_len,
                                     client->config.send_timeout_ms);
+        pthread_mutex_unlock(&client->io_lock);
     }
-    pthread_mutex_unlock(&client->io_lock);
-    pthread_mutex_unlock(&client->state_lock);
     free(envelope);
     return st;
 }
@@ -360,7 +441,7 @@ bool sensor_mgr_ipc_client_is_connected(sensor_mgr_ipc_client_t *client) {
         return false;
     }
     pthread_mutex_lock(&client->state_lock);
-    bool connected = client->connected;
+    bool connected = client->connection_state == SENSOR_MGR_IPC_CONNECTED;
     pthread_mutex_unlock(&client->state_lock);
     client_leave(client);
     return connected;
@@ -386,9 +467,23 @@ void sensor_mgr_ipc_client_destroy(sensor_mgr_ipc_client_t *client) {
         return;
     }
     if (self_worker) {
-        /* Worker callback: request terminal shutdown, then return to the
-         * callback/dispatch stack. worker_mark_finished() finalizes after
-         * that stack has stopped using client. */
+        /* A callback destroy may detach only when no external caller has
+         * already claimed pthread_join(). The destroy claim prevents new
+         * joiners; an already-claimed join makes this void operation a safe
+         * stop-only no-op so the owner can destroy after join returns. */
+        pthread_mutex_lock(&client->lifecycle_lock);
+        if (client->join_in_progress) {
+            pthread_mutex_unlock(&client->lifecycle_lock);
+            client_unclaim_destroy(client);
+            (void)stop_impl(client);
+            client_leave(client);
+            return;
+        }
+        if (!client->worker_detached) {
+            (void)pthread_detach(client->worker_thread);
+            client->worker_detached = true;
+        }
+        pthread_mutex_unlock(&client->lifecycle_lock);
         (void)stop_impl(client);
         client_leave(client);
         return;
@@ -432,11 +527,48 @@ static void interruptible_backoff_sleep(sensor_mgr_ipc_client_t *client, uint32_
     pthread_mutex_unlock(&client->lifecycle_lock);
 }
 
-static void set_connected(sensor_mgr_ipc_client_t *client, const savvy_ipc_transport_t *transport) {
+static void set_transport_connected(sensor_mgr_ipc_client_t *client,
+                                    const savvy_ipc_transport_t *transport) {
     pthread_mutex_lock(&client->state_lock);
     client->transport = *transport;
-    client->connected = true;
+    client->connection_state = SENSOR_MGR_IPC_TRANSPORT_CONNECTED;
     pthread_mutex_unlock(&client->state_lock);
+}
+
+static savvy_status_t send_connect_handshake(sensor_mgr_ipc_client_t *client) {
+    char *envelope = NULL;
+    size_t envelope_len = 0;
+    savvy_status_t st = savvy_ipc_envelope_build(SENSOR_MGR_IPC_ACTION_CONNECT,
+                                                  "{}", &envelope, &envelope_len);
+    if (st != SAVVY_OK) {
+        return st;
+    }
+
+    pthread_mutex_lock(&client->state_lock);
+    if (client->connection_state != SENSOR_MGR_IPC_TRANSPORT_CONNECTED) {
+        pthread_mutex_unlock(&client->state_lock);
+        free(envelope);
+        return SAVVY_ERR_CANCELLED;
+    }
+    client->connection_state = SENSOR_MGR_IPC_HANDSHAKING;
+    pthread_mutex_unlock(&client->state_lock);
+
+    /* Before CONNECT succeeds the worker exclusively owns transport I/O:
+     * public send rejects HANDSHAKING and recv has not started. External
+     * teardown joins this worker before close, so the transport remains
+     * alive while a blocking handshake send is in progress. */
+    st = client->transport.send(&client->transport, envelope, envelope_len,
+                                client->config.send_timeout_ms);
+    free(envelope);
+
+    pthread_mutex_lock(&client->state_lock);
+    if (st == SAVVY_OK && client->connection_state == SENSOR_MGR_IPC_HANDSHAKING) {
+        client->connection_state = SENSOR_MGR_IPC_CONNECTED;
+    } else if (st == SAVVY_OK) {
+        st = SAVVY_ERR_CANCELLED;
+    }
+    pthread_mutex_unlock(&client->state_lock);
+    return st;
 }
 
 static void mark_reconnect(void *user_data) {
@@ -482,11 +614,15 @@ static void *worker_main(void *arg) {
             continue;
         }
 
-        set_connected(client, &transport);
+        set_transport_connected(client, &transport);
+        if (is_shutdown_requested(client)) {
+            close_transport(client);
+            break;
+        }
 
         /* CONNECT is a real handshake: it must complete before the client
          * becomes observable as connected or starts receiving messages. */
-        st = send_impl(client, SENSOR_MGR_IPC_ACTION_CONNECT, "{}");
+        st = send_connect_handshake(client);
         if (st != SAVVY_OK) {
             close_transport(client);
             notify_disconnected(client);
@@ -506,16 +642,15 @@ static void *worker_main(void *arg) {
             size_t out_len = 0;
 
             pthread_mutex_lock(&client->state_lock);
-            pthread_mutex_lock(&client->io_lock);
-            if (!client->connected) {
-                pthread_mutex_unlock(&client->io_lock);
+            if (client->connection_state != SENSOR_MGR_IPC_CONNECTED) {
                 pthread_mutex_unlock(&client->state_lock);
                 break;
             }
+            pthread_mutex_lock(&client->io_lock);
+            pthread_mutex_unlock(&client->state_lock);
             savvy_status_t recv_st = client->transport.recv(&client->transport, buf, sizeof(buf),
                                                              &out_len, client->config.recv_poll_timeout_ms);
             pthread_mutex_unlock(&client->io_lock);
-            pthread_mutex_unlock(&client->state_lock);
 
             if (recv_st == SAVVY_ERR_TIMEOUT || recv_st == SAVVY_ERR_OVERFLOW) {
                 continue;

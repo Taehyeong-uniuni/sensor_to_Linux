@@ -86,6 +86,17 @@ static savvy_status_t fd_transport_send(savvy_ipc_transport_t *self, const void 
     fake_transport_impl_t *impl = (fake_transport_impl_t *)self->impl;
     int fd = impl->fd;
     pthread_mutex_lock(&impl->ctx->lock);
+    impl->ctx->send_count += 1;
+    if (impl->ctx->block_next_send) {
+        impl->ctx->block_next_send = false;
+        impl->ctx->send_is_blocked = true;
+        pthread_cond_broadcast(&impl->ctx->send_cond);
+        while (!impl->ctx->release_blocked_send) {
+            pthread_cond_wait(&impl->ctx->send_cond, &impl->ctx->lock);
+        }
+        impl->ctx->send_is_blocked = false;
+        impl->ctx->release_blocked_send = false;
+    }
     if (impl->ctx->send_failures_remaining > 0) {
         impl->ctx->send_failures_remaining -= 1;
         savvy_status_t status = impl->ctx->send_failure_status;
@@ -166,6 +177,7 @@ static void fd_transport_close(savvy_ipc_transport_t *self) {
     }
     pthread_mutex_lock(&impl->ctx->lock);
     impl->ctx->close_count += 1;
+    pthread_cond_broadcast(&impl->ctx->send_cond);
     pthread_mutex_unlock(&impl->ctx->lock);
     free(impl);
     self->impl = NULL;
@@ -176,11 +188,20 @@ savvy_status_t fake_connector_init(fake_connector_ctx_t *ctx, size_t queue_capac
     ctx->send_failures_remaining = 0;
     ctx->send_failure_status = SAVVY_ERR_IO;
     ctx->close_count = 0;
+    ctx->send_count = 0;
+    ctx->block_next_send = false;
+    ctx->send_is_blocked = false;
+    ctx->release_blocked_send = false;
     if (pthread_mutex_init(&ctx->lock, NULL) != 0) {
+        return SAVVY_ERR_UNKNOWN;
+    }
+    if (pthread_cond_init(&ctx->send_cond, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->lock);
         return SAVVY_ERR_UNKNOWN;
     }
     savvy_status_t st = savvy_queue_init(&ctx->mgr_fd_queue, queue_capacity, sizeof(int), NULL);
     if (st != SAVVY_OK) {
+        pthread_cond_destroy(&ctx->send_cond);
         pthread_mutex_destroy(&ctx->lock);
     }
     return st;
@@ -189,6 +210,7 @@ savvy_status_t fake_connector_init(fake_connector_ctx_t *ctx, size_t queue_capac
 void fake_connector_destroy(fake_connector_ctx_t *ctx) {
     savvy_queue_close(&ctx->mgr_fd_queue);
     savvy_queue_destroy(&ctx->mgr_fd_queue);
+    pthread_cond_destroy(&ctx->send_cond);
     pthread_mutex_destroy(&ctx->lock);
 }
 
@@ -204,6 +226,71 @@ int fake_connector_close_count(fake_connector_ctx_t *ctx) {
     int count = ctx->close_count;
     pthread_mutex_unlock(&ctx->lock);
     return count;
+}
+
+int fake_connector_send_count(fake_connector_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    int count = ctx->send_count;
+    pthread_mutex_unlock(&ctx->lock);
+    return count;
+}
+
+void fake_connector_block_next_send(fake_connector_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    ctx->block_next_send = true;
+    ctx->send_is_blocked = false;
+    ctx->release_blocked_send = false;
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+bool fake_connector_wait_send_blocked(fake_connector_ctx_t *ctx, uint32_t timeout_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(timeout_ms / 1000u);
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+    while (!ctx->send_is_blocked) {
+        if (pthread_cond_timedwait(&ctx->send_cond, &ctx->lock, &deadline) != 0) {
+            pthread_mutex_unlock(&ctx->lock);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return true;
+}
+
+void fake_connector_release_blocked_send(fake_connector_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    ctx->release_blocked_send = true;
+    pthread_cond_broadcast(&ctx->send_cond);
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+bool fake_connector_wait_close_count(fake_connector_ctx_t *ctx, int expected,
+                                     uint32_t timeout_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(timeout_ms / 1000u);
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+    while (ctx->close_count < expected) {
+        if (pthread_cond_timedwait(&ctx->send_cond, &ctx->lock, &deadline) != 0) {
+            pthread_mutex_unlock(&ctx->lock);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return true;
 }
 
 savvy_status_t fake_connector_connect(void *connector_ctx, uint32_t timeout_ms,

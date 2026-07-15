@@ -26,6 +26,12 @@ savvy_status_t sensor_lifecycle_init(sensor_lifecycle_t *lc) {
         return SAVVY_ERR_INVALID_ARGUMENT;
     }
 
+    /* Keep observable fields defined even when a later primitive init
+     * fails. destroy() is valid only after this function returns SAVVY_OK. */
+    memset(lc->modules, 0, sizeof(lc->modules));
+    lc->module_count = 0;
+    lc->callback_depth = 0;
+
     savvy_status_t st = savvy_lifecycle_init(&lc->base);
     if (st != SAVVY_OK) {
         return st;
@@ -35,8 +41,6 @@ savvy_status_t sensor_lifecycle_init(sensor_lifecycle_t *lc) {
         return SAVVY_ERR_UNKNOWN;
     }
 
-    memset(lc->modules, 0, sizeof(lc->modules));
-    lc->module_count = 0;
     return SAVVY_OK;
 }
 
