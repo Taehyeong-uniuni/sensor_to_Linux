@@ -1,5 +1,6 @@
 #include "sensor_stream/session.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,20 +23,20 @@
 #define WIRE_CMD_PIROUT      ((uint8_t)'O')
 #define WIRE_CMD_RESPONSE    ((uint8_t)'R')
 
-/* Max encoded packet the transport ever has to hold: SAVVY_PACKET_HEADER_LEN
- * plus the largest possible body. Chosen per-role by the caller via
- * sensor_stream_config_t.max_payload_size, which sizes the tcp_channel's
- * reassembly buffer for INBOUND responses too - responses are always tiny
- * ({result:N} bodies), so this is dominated by our own largest OUTGOING
- * payload, but the transport buffer is shared for both directions. */
+/* BZ2_bzBuffToBuffCompress's documented safe output bound. The streaming
+ * wrapper used by this feature grows dynamically, but the session must
+ * reserve the same worst-case capacity before packet encoding. */
+#define SENSOR_BZIP_BOUND_DIVISOR 100u
+#define SENSOR_BZIP_BOUND_EXTRA   600u
 
 struct sensor_stream_session {
     sensor_stream_role_t role;
     sensor_tcp_channel_t *channel;
     sensor_result_policy_t *policy; /* owned by this session (created here, destroyed here) */
     int compress;
+    size_t max_payload_size; /* caller-visible maximum raw input size */
     uint8_t device_serial[SAVVY_PACKET_SERIAL_LEN];
-    uint8_t *encode_buf; /* scratch buffer for outgoing packet encoding, sized to max_payload_size + header */
+    uint8_t *encode_buf; /* role/codec-expanded packet scratch buffer */
     size_t encode_buf_cap;
 };
 
@@ -48,6 +49,53 @@ typedef struct pending_send {
 static uint8_t session_start_byte(const sensor_stream_session_t *s)
 {
     return s->role == SENSOR_STREAM_ROLE_STREAM ? WIRE_START_STREAM : WIRE_START_VOICE;
+}
+
+static savvy_status_t calculate_encoded_packet_capacity(sensor_stream_role_t role,
+                                                          int compress,
+                                                          size_t max_payload_size,
+                                                          size_t *out_capacity)
+{
+    if (out_capacity == NULL) {
+        return SAVVY_ERR_INVALID_ARGUMENT;
+    }
+
+    size_t body_capacity = max_payload_size;
+    if (role == SENSOR_STREAM_ROLE_VOICE) {
+        if (body_capacity > SIZE_MAX - (size_t)SENSOR_WAV_HEADER_LEN) {
+            return SAVVY_ERR_OVERFLOW;
+        }
+        body_capacity += (size_t)SENSOR_WAV_HEADER_LEN;
+    } else if (role != SENSOR_STREAM_ROLE_STREAM) {
+        return SAVVY_ERR_INVALID_ARGUMENT;
+    }
+
+    if (compress == 1) {
+        /* sensor_bzip_compress() accepts at most UINT_MAX input bytes. */
+        if (body_capacity > (size_t)UINT_MAX) {
+            return SAVVY_ERR_OVERFLOW;
+        }
+        size_t growth = body_capacity / (size_t)SENSOR_BZIP_BOUND_DIVISOR;
+        if (body_capacity > SIZE_MAX - growth) {
+            return SAVVY_ERR_OVERFLOW;
+        }
+        body_capacity += growth;
+        if (body_capacity > SIZE_MAX - (size_t)SENSOR_BZIP_BOUND_EXTRA) {
+            return SAVVY_ERR_OVERFLOW;
+        }
+        body_capacity += (size_t)SENSOR_BZIP_BOUND_EXTRA;
+    }
+
+    /* The Foundation packet Length field is exactly 32 bits. */
+    if (body_capacity > (size_t)UINT32_MAX) {
+        return SAVVY_ERR_OVERFLOW;
+    }
+    if (body_capacity > SIZE_MAX - (size_t)SAVVY_PACKET_HEADER_LEN) {
+        return SAVVY_ERR_OVERFLOW;
+    }
+
+    *out_capacity = (size_t)SAVVY_PACKET_HEADER_LEN + body_capacity;
+    return SAVVY_OK;
 }
 
 static void on_pirin_complete(const sensor_tcp_result_t *result, void *ctx_v)
@@ -126,6 +174,9 @@ savvy_status_t sensor_stream_session_send_data(sensor_stream_session_t *session,
 {
     if (session == NULL || (payload == NULL && payload_len > 0)) {
         return SAVVY_ERR_INVALID_ARGUMENT;
+    }
+    if (payload_len > session->max_payload_size) {
+        return SAVVY_ERR_OVERFLOW;
     }
 
     uint8_t device = 0, config = 0;
@@ -253,6 +304,9 @@ savvy_status_t sensor_stream_session_relay_rknn_result(sensor_stream_session_t *
     if (session == NULL || session->role != SENSOR_STREAM_ROLE_STREAM) {
         return SAVVY_ERR_INVALID_ARGUMENT;
     }
+    if (payload_len > session->max_payload_size) {
+        return SAVVY_ERR_OVERFLOW;
+    }
     size_t written = 0;
     savvy_status_t st = savvy_packet_encode(WIRE_START_RKNN_RESULT, WIRE_CMD_STREAM, 0, 0,
                                              session->device_serial, sizeof(session->device_serial),
@@ -273,9 +327,16 @@ savvy_status_t sensor_stream_session_create(sensor_stream_session_t **out_sessio
         return SAVVY_ERR_INVALID_ARGUMENT;
     }
     *out_session = NULL;
-    if (config == NULL || config->server_ip == NULL || config->device_serial == NULL ||
-        config->max_payload_size < SAVVY_PACKET_HEADER_LEN) {
+    if (config == NULL || config->server_ip == NULL || config->device_serial == NULL) {
         return SAVVY_ERR_INVALID_ARGUMENT;
+    }
+
+    size_t encoded_packet_capacity = 0;
+    savvy_status_t st = calculate_encoded_packet_capacity(role, config->compress,
+                                                           config->max_payload_size,
+                                                           &encoded_packet_capacity);
+    if (st != SAVVY_OK) {
+        return st;
     }
 
     sensor_stream_session_t *s = (sensor_stream_session_t *)calloc(1, sizeof(*s));
@@ -284,17 +345,18 @@ savvy_status_t sensor_stream_session_create(sensor_stream_session_t **out_sessio
     }
     s->role = role;
     s->compress = config->compress;
+    s->max_payload_size = config->max_payload_size;
     memcpy(s->device_serial, config->device_serial, sizeof(s->device_serial));
 
-    s->encode_buf_cap = config->max_payload_size;
+    s->encode_buf_cap = encoded_packet_capacity;
     s->encode_buf = (uint8_t *)malloc(s->encode_buf_cap);
     if (s->encode_buf == NULL) {
         free(s);
         return SAVVY_ERR_OUT_OF_MEMORY;
     }
 
-    savvy_status_t st = sensor_tcp_channel_create(&s->channel, config->server_ip, config->server_port,
-                                                   config->max_payload_size, 4 /* bounded queue depth */);
+    st = sensor_tcp_channel_create(&s->channel, config->server_ip, config->server_port,
+                                   encoded_packet_capacity, 4 /* bounded queue depth */);
     if (st != SAVVY_OK) {
         free(s->encode_buf);
         free(s);

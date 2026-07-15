@@ -42,7 +42,7 @@ typedef struct sensor_stream_config {
     int compress;                      /* mirrors pinned jsonConfigDto.compress: 0=raw, 1=bzip2 */
     uint32_t danger_count_threshold;   /* mirrors pinned jsonConfigDto.dangerCount - Stream role only, ignored for Voice */
     const uint8_t *device_serial;      /* exactly SAVVY_PACKET_SERIAL_LEN bytes */
-    size_t max_payload_size;           /* sizes the transport's reassembly buffer - Stream: ToF-frame-sized (~1.8MB pinned); Voice: mic-buffer-sized (~100KB pinned) */
+    size_t max_payload_size;           /* maximum raw input accepted by send_data/relay before any packet header, Voice WAV header, or optional BZip expansion; the session derives a larger overflow-checked encoded packet/transport capacity internally */
 } sensor_stream_config_t;
 
 /* Invoked once per send call's outcome, from the channel's own worker

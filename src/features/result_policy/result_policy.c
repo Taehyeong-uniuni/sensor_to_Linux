@@ -60,8 +60,8 @@ static bool is_ws(char c)
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-static bool normalize_unquoted_result_key(const char *body, size_t body_len,
-                                           char **out_rewritten, size_t *out_rewritten_len)
+static bool find_unquoted_result_key(const char *body, size_t body_len,
+                                     size_t *out_key_start, size_t *out_key_end)
 {
     size_t i = 0;
     while (i < body_len && is_ws(body[i])) {
@@ -77,7 +77,7 @@ static bool normalize_unquoted_result_key(const char *body, size_t body_len,
 
     static const char KEY[] = "result";
     const size_t key_len = sizeof(KEY) - 1;
-    if (i + key_len > body_len || strncmp(body + i, KEY, key_len) != 0) {
+    if (key_len > body_len - i || strncmp(body + i, KEY, key_len) != 0) {
         return false;
     }
     size_t key_start = i;
@@ -90,27 +90,50 @@ static bool normalize_unquoted_result_key(const char *body, size_t body_len,
         return false;
     }
 
-    /* Matched exactly `<ws>{<ws>result<ws>:` - rewrite to
-     * `<ws>{<ws>"result"<ws>:`, copying everything else (including the
-     * value and closing brace, whatever they are) through untouched. */
-    if (body_len > SIZE_MAX - 2) {
-        return false; /* would overflow; let the unmodified body pass through and fail parsing normally */
-    }
-    size_t new_len = body_len + 2;
-    char *out = (char *)malloc(new_len);
-    if (out == NULL) {
-        return false; /* OOM: fall through to parsing the unmodified body (will correctly fail) rather than crash */
-    }
-
-    memcpy(out, body, key_start);
-    out[key_start] = '"';
-    memcpy(out + key_start + 1, body + key_start, key_len);
-    out[key_start + 1 + key_len] = '"';
-    memcpy(out + key_start + 1 + key_len + 1, body + key_end, body_len - key_end);
-
-    *out_rewritten = out;
-    *out_rewritten_len = new_len;
+    *out_key_start = key_start;
+    *out_key_end = key_end;
     return true;
+}
+
+/* Foundation's JSON parser requires text[len] to be an accessible NUL
+ * byte. Always make an owned parser input, including for already-valid
+ * quoted JSON; the response body is a counted packet field and is not a
+ * C string. When the one supported bareword key is present, reserve two
+ * additional bytes for the quotes as well as the final terminator. */
+static savvy_status_t make_parser_input(const char *body, size_t body_len,
+                                         char **out_text, size_t *out_len)
+{
+    size_t key_start = 0;
+    size_t key_end = 0;
+    bool rewrite = find_unquoted_result_key(body, body_len, &key_start, &key_end);
+    size_t extra = rewrite ? 2u : 0u;
+
+    if (body_len > SIZE_MAX - extra - 1u) {
+        return SAVVY_ERR_OVERFLOW;
+    }
+    size_t parser_len = body_len + extra;
+    char *text = (char *)malloc(parser_len + 1u);
+    if (text == NULL) {
+        return SAVVY_ERR_OUT_OF_MEMORY;
+    }
+
+    if (rewrite) {
+        /* Matched exactly `<ws>{<ws>result<ws>:` - rewrite to
+         * `<ws>{<ws>"result"<ws>:`, copying everything else (including
+         * the value and closing brace, whatever they are) untouched. */
+        memcpy(text, body, key_start);
+        text[key_start] = '"';
+        memcpy(text + key_start + 1u, body + key_start, key_end - key_start);
+        text[key_end + 1u] = '"';
+        memcpy(text + key_end + 2u, body + key_end, body_len - key_end);
+    } else {
+        memcpy(text, body, body_len);
+    }
+    text[parser_len] = '\0';
+
+    *out_text = text;
+    *out_len = parser_len;
+    return SAVVY_OK;
 }
 
 savvy_status_t sensor_result_policy_create(sensor_result_policy_t **out_policy,
@@ -157,15 +180,16 @@ void sensor_result_policy_on_response(sensor_result_policy_t *policy, const char
         return; /* no usable body (e.g. CRC-failed response passed through as empty): documented no-op */
     }
 
-    char *rewritten = NULL;
-    size_t rewritten_len = 0;
-    bool did_rewrite = normalize_unquoted_result_key(body, body_len, &rewritten, &rewritten_len);
+    char *parser_text = NULL;
+    size_t parser_len = 0;
+    savvy_status_t st = make_parser_input(body, body_len, &parser_text, &parser_len);
+    if (st != SAVVY_OK) {
+        return;
+    }
 
     savvy_data_result_t dr;
-    savvy_status_t st = did_rewrite
-        ? savvy_data_result_parse(rewritten, rewritten_len, &dr)
-        : savvy_data_result_parse(body, body_len, &dr);
-    free(rewritten);
+    st = savvy_data_result_parse(parser_text, parser_len, &dr);
+    free(parser_text);
 
     if (st != SAVVY_OK) {
         return; /* parse failure: no-op, matching the pinned Android dropped-Gson-exception contract */

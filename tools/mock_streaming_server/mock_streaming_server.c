@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -70,12 +71,56 @@ static int make_listener(uint16_t requested_port, uint16_t *out_port)
     return fd;
 }
 
+static bool send_all_bytes(int fd, const uint8_t *data, size_t data_len)
+{
+    size_t off = 0;
+    while (off < data_len) {
+        ssize_t n = send(fd, data + off, data_len - off, 0);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static size_t encode_response(uint8_t start, uint8_t command,
+                              const uint8_t *data, size_t data_len,
+                              uint8_t *buf, size_t buf_cap)
+{
+    size_t written = 0;
+    if (savvy_packet_encode(start, command, 0, 0, SERIAL, sizeof(SERIAL),
+                            data, data_len, buf, buf_cap, &written) != SAVVY_OK) {
+        return 0;
+    }
+    return written;
+}
+
 static void send_packet(int fd, uint8_t start, uint8_t command, const uint8_t *data, size_t data_len)
 {
     uint8_t buf[262144];
-    size_t written = 0;
-    if (savvy_packet_encode(start, command, 0, 0, SERIAL, sizeof(SERIAL), data, data_len, buf, sizeof(buf), &written) == SAVVY_OK) {
-        send(fd, buf, written, 0);
+    size_t written = encode_response(start, command, data, data_len, buf, sizeof(buf));
+    if (written > 0) {
+        (void)send_all_bytes(fd, buf, written);
+    }
+}
+
+static void send_split_response(int fd, uint8_t start, size_t first_chunk_len)
+{
+    static const uint8_t BODY[] = "{result:4}";
+    uint8_t buf[512];
+    size_t written = encode_response(start, (uint8_t)'R', BODY, sizeof(BODY) - 1u,
+                                     buf, sizeof(buf));
+    if (written == 0 || first_chunk_len == 0 || first_chunk_len >= written) {
+        return;
+    }
+    if (send_all_bytes(fd, buf, first_chunk_len)) {
+        usleep(20 * 1000);
+        (void)send_all_bytes(fd, buf + first_chunk_len, written - first_chunk_len);
     }
 }
 
@@ -117,6 +162,8 @@ static bool read_one_packet(int fd, uint8_t *scratch, size_t scratch_cap, read_s
 
 int main(int argc, char **argv)
 {
+    signal(SIGPIPE, SIG_IGN);
+
     const char *fixture = NULL;
     uint16_t requested_port = 0;
     for (int i = 1; i < argc; i++) {
@@ -188,15 +235,18 @@ int main(int argc, char **argv)
         savvy_packet_header_t hdr;
         const uint8_t *data = NULL;
         size_t data_len = 0;
-        if (read_one_packet(fd, scratch, sizeof(scratch), READ_HEADER_THEN_BODY_SEPARATELY, &hdr, &data, &data_len)) {
-            send_packet(fd, hdr.start, (uint8_t)'R', (const uint8_t *)"{result:4}", 10);
+        if (read_one_packet(fd, scratch, sizeof(scratch), READ_NORMAL, &hdr, &data, &data_len)) {
+            /* Split inside the 26-byte RESPONSE header. */
+            send_split_response(fd, hdr.start, 5u);
         }
     } else if (strcmp(fixture, "split-body") == 0) {
         savvy_packet_header_t hdr;
         const uint8_t *data = NULL;
         size_t data_len = 0;
-        if (read_one_packet(fd, scratch, sizeof(scratch), READ_ONE_BYTE_AT_A_TIME, &hdr, &data, &data_len)) {
-            send_packet(fd, hdr.start, (uint8_t)'R', (const uint8_t *)"{result:4}", 10);
+        if (read_one_packet(fd, scratch, sizeof(scratch), READ_NORMAL, &hdr, &data, &data_len)) {
+            /* Send the full header plus three response-body bytes, then
+             * the remainder, so fragmentation is response-side. */
+            send_split_response(fd, hdr.start, (size_t)SAVVY_PACKET_HEADER_LEN + 3u);
         }
     } else if (strcmp(fixture, "coalesced") == 0) {
         /* Reads and answers TWO requests, but the two responses below are
@@ -281,7 +331,7 @@ int main(int argc, char **argv)
         const uint8_t *data = NULL;
         size_t data_len = 0;
         if (read_one_packet(fd, scratch, sizeof(scratch), READ_NORMAL, &hdr, &data, &data_len)) {
-            sleep(4); /* exceeds the pinned 3000ms response timeout */
+            usleep(600 * 1000); /* paired CTest uses a bounded 250ms response timeout */
             send_packet(fd, hdr.start, (uint8_t)'R', (const uint8_t *)"{result:4}", 10);
         }
     } else if (strcmp(fixture, "stale-response-after-timeout") == 0) {
@@ -289,19 +339,38 @@ int main(int argc, char **argv)
         const uint8_t *data = NULL;
         size_t data_len = 0;
         if (read_one_packet(fd, scratch, sizeof(scratch), READ_NORMAL, &hdr, &data, &data_len)) {
-            sleep(4); /* client will have already timed out and closed its end by now */
+            usleep(600 * 1000); /* client times out at 250ms and closes before this late response */
             send_packet(fd, hdr.start, (uint8_t)'R', (const uint8_t *)"{result:4}", 10); /* write to an already-closed peer - expected to fail/be ignored */
         }
     } else if (strcmp(fixture, "disconnect-before-header") == 0) {
-        /* Close immediately without reading or responding at all. */
+        savvy_packet_header_t hdr;
+        const uint8_t *data = NULL;
+        size_t data_len = 0;
+        /* Consume the request, then close without sending any RESPONSE
+         * header bytes. */
+        (void)read_one_packet(fd, scratch, sizeof(scratch), READ_NORMAL, &hdr, &data, &data_len);
     } else if (strcmp(fixture, "disconnect-during-body") == 0) {
-        uint8_t buf[SAVVY_PACKET_HEADER_LEN + 4];
-        recv(fd, buf, sizeof(buf), 0); /* read only the header + a few body bytes, then close mid-body */
+        savvy_packet_header_t hdr;
+        const uint8_t *data = NULL;
+        size_t data_len = 0;
+        if (read_one_packet(fd, scratch, sizeof(scratch), READ_NORMAL, &hdr, &data, &data_len)) {
+            uint8_t response[512];
+            size_t response_len = encode_response(hdr.start, (uint8_t)'R',
+                                                  (const uint8_t *)"{result:4}", 10,
+                                                  response, sizeof(response));
+            if (response_len > (size_t)SAVVY_PACKET_HEADER_LEN + 4u) {
+                /* Full response header plus only four body bytes, then
+                 * close before the declared body is complete. */
+                (void)send_all_bytes(fd, response, (size_t)SAVVY_PACKET_HEADER_LEN + 4u);
+            }
+        }
     } else if (strcmp(fixture, "stream-only-failure") == 0) {
-        /* Accept and immediately close - simulates a Stream-role failure;
-         * the caller is expected to run a SEPARATE, healthy mock server
-         * instance on another port for the Voice role in the same test,
-         * to prove isolation (this process only models one side). */
+        savvy_packet_header_t hdr;
+        const uint8_t *data = NULL;
+        size_t data_len = 0;
+        /* Consume the Stream request and close without a response. The
+         * paired test runs a separate healthy Voice fixture concurrently. */
+        (void)read_one_packet(fd, scratch, sizeof(scratch), READ_NORMAL, &hdr, &data, &data_len);
     } else if (strcmp(fixture, "voice-only-failure") == 0) {
         /* Same shape as stream-only-failure, named separately only for
          * fixture-selection clarity at the call site. */

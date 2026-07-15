@@ -97,6 +97,22 @@ static void test_002(void)
     sensor_result_policy_on_response(p, unquoted_with_space, strlen(unquoted_with_space));
     CHECK(probe.calls == 0, "unquoted-with-space normal result must not alert");
 
+    /* Counted packet bodies are not C strings. These exact-size arrays
+     * deliberately have no byte available at body[body_len]; sanitizer
+     * coverage proves both quoted and rewritten parser inputs get their
+     * own NUL terminator. */
+    const char quoted_without_nul[] = {'{','"','r','e','s','u','l','t','"',':','4','}'};
+    sensor_result_policy_on_response(p, quoted_without_nul, sizeof(quoted_without_nul));
+    CHECK(probe.calls == 0, "quoted counted body without a terminator parses safely");
+
+    const char unquoted_without_nul[] = {'{','r','e','s','u','l','t',':','4','}'};
+    sensor_result_policy_on_response(p, unquoted_without_nul, sizeof(unquoted_without_nul));
+    CHECK(probe.calls == 0, "unquoted counted body without a terminator parses safely");
+
+    const char *unquoted_negative = "{result:-1}";
+    sensor_result_policy_on_response(p, unquoted_negative, strlen(unquoted_negative));
+    CHECK(probe.calls == 1, "unquoted negative result must alert exactly once");
+
     sensor_result_policy_destroy(p);
 
     /* Negative control: the normalizer must NOT rewrite input that does
@@ -106,9 +122,24 @@ static void test_002(void)
     sensor_result_policy_t *p2 = NULL;
     alert_probe_t probe2 = {0};
     sensor_result_policy_create(&p2, SENSOR_RESULT_ROLE_VOICE, 4, probe_alert, &probe2);
-    const char *other_key = "{other:7}";
-    sensor_result_policy_on_response(p2, other_key, strlen(other_key));
-    CHECK(probe2.calls == 0, "unrelated unquoted key must not be rewritten into a match");
+    const char *resultx = "{resultx:7}";
+    sensor_result_policy_on_response(p2, resultx, strlen(resultx));
+    CHECK(probe2.calls == 0, "resultx bareword key must not be rewritten");
+
+    const char *myresult = "{myresult:7}";
+    sensor_result_policy_on_response(p2, myresult, strlen(myresult));
+    CHECK(probe2.calls == 0, "myresult bareword key must not be rewritten");
+
+    const char *result_in_string = "{\"text\":\"result:\",\"result\":4}";
+    sensor_result_policy_on_response(p2, result_in_string, strlen(result_in_string));
+    CHECK(probe2.calls == 0, "result: inside a string must remain unchanged");
+
+    const char *truncated = "{result:4";
+    sensor_result_policy_on_response(p2, truncated, strlen(truncated));
+    CHECK(probe2.calls == 0, "truncated unquoted input must remain a parse-failure no-op");
+
+    sensor_result_policy_on_response(p2, "", 0);
+    CHECK(probe2.calls == 0, "empty input must remain a no-op");
     sensor_result_policy_destroy(p2);
 }
 

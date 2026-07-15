@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 
 #include "sensor_stream/session.h"
+#include "sensor_stream/wav.h"
 #include "savvy/protocol/packet_codec.h"
 #include "savvy/protocol/stream_parser.h"
 
@@ -45,6 +46,9 @@ typedef struct {
     uint8_t seen_device;
     uint8_t seen_config;
     bool seen_wav_magic; /* out: true if a body started with "RIFF" (proves WAV-wrap happened before this arrived) */
+    size_t data_lengths[8];
+    uint8_t data_commands[8];
+    size_t data_count;
 } mock_server_t;
 
 static bool make_listener(mock_server_t *m)
@@ -146,6 +150,11 @@ static void *mock_server_thread(void *arg)
                 m->seen_device = hdr.device;
                 m->seen_config = hdr.config;
                 m->seen_wav_magic = (data_len >= 4 && memcmp(data, "RIFF", 4) == 0);
+                if (m->data_count < sizeof(m->data_lengths) / sizeof(m->data_lengths[0])) {
+                    m->data_lengths[m->data_count] = data_len;
+                    m->data_commands[m->data_count] = hdr.command;
+                }
+                m->data_count++;
                 const char *body = m->danger_result_body != NULL ? m->danger_result_body : "{result:4}";
                 send_packet(fd, hdr.start, (uint8_t)'R', (const uint8_t *)body, strlen(body));
             }
@@ -358,10 +367,168 @@ static void test_isolation(void)
     close(srv_v.listen_fd);
 }
 
+static void fill_high_entropy(uint8_t *data, size_t len)
+{
+    uint32_t state = 0x9e3779b9u;
+    for (size_t i = 0; i < len; i++) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        data[i] = (uint8_t)state;
+    }
+}
+
+static sensor_stream_config_t boundary_config(uint16_t port, int compress, size_t max_payload_size)
+{
+    sensor_stream_config_t cfg = {0};
+    cfg.server_ip = "127.0.0.1";
+    cfg.server_port = port;
+    cfg.compress = compress;
+    cfg.danger_count_threshold = 4;
+    cfg.device_serial = SERIAL;
+    cfg.max_payload_size = max_payload_size;
+    return cfg;
+}
+
+/* CDX-W1-SENSOR-STREAM-002: max_payload_size is the maximum caller raw
+ * input, independent of the packet/WAV/BZip encoded capacity. This is a
+ * production-session-API regression test, replacing the original
+ * print-only repro_boundary_before.c probe. */
+static void test_payload_boundaries(void)
+{
+    enum { RAW_MAX = 128 };
+    uint8_t payload[RAW_MAX + 1];
+    fill_high_entropy(payload, sizeof(payload));
+
+    mock_server_t stream_raw = {0};
+    CHECK(make_listener(&stream_raw), "create Stream raw boundary server");
+    stream_raw.expected_connections = 1;
+    pthread_t stream_raw_thread;
+    pthread_create(&stream_raw_thread, NULL, mock_server_thread, &stream_raw);
+
+    sensor_stream_config_t cfg = boundary_config(stream_raw.port, 0, RAW_MAX);
+    sensor_stream_session_t *session = NULL;
+    CHECK(sensor_stream_session_create(&session, SENSOR_STREAM_ROLE_STREAM, &cfg, NULL, NULL) == SAVVY_OK,
+          "create Stream session with raw max=128");
+    CHECK(sensor_stream_session_start(session) == SAVVY_OK, "start Stream raw boundary session");
+    sent_capture_t stream_127 = {0}, stream_128 = {0}, stream_129 = {0};
+    CHECK(sensor_stream_session_send_data(session, payload, RAW_MAX - 1u, 0, capture_sent, &stream_127) == SAVVY_OK,
+          "Stream max-1 is accepted");
+    CHECK(sensor_stream_session_send_data(session, payload, RAW_MAX, 0, capture_sent, &stream_128) == SAVVY_OK,
+          "Stream max is accepted");
+    CHECK(sensor_stream_session_send_data(session, payload, RAW_MAX + 1u, 0, capture_sent, &stream_129) == SAVVY_ERR_OVERFLOW,
+          "Stream max+1 is rejected");
+    usleep(500 * 1000);
+    CHECK(stream_127.calls == 1 && stream_127.last_ok, "Stream max-1 completes through production TCP");
+    CHECK(stream_128.calls == 1 && stream_128.last_ok, "Stream max completes through production TCP");
+    CHECK(stream_129.calls == 0, "rejected Stream max+1 has no callback");
+    CHECK(stream_raw.data_count == 2 && stream_raw.data_lengths[0] == RAW_MAX - 1u && stream_raw.data_lengths[1] == RAW_MAX,
+          "Stream wire bodies preserve max-1/max raw lengths");
+    sensor_stream_session_destroy(session);
+    pthread_join(stream_raw_thread, NULL);
+    close(stream_raw.listen_fd);
+
+    mock_server_t voice_raw = {0};
+    CHECK(make_listener(&voice_raw), "create Voice raw boundary server");
+    voice_raw.expected_connections = 1;
+    pthread_t voice_raw_thread;
+    pthread_create(&voice_raw_thread, NULL, mock_server_thread, &voice_raw);
+
+    cfg = boundary_config(voice_raw.port, 0, RAW_MAX);
+    session = NULL;
+    CHECK(sensor_stream_session_create(&session, SENSOR_STREAM_ROLE_VOICE, &cfg, NULL, NULL) == SAVVY_OK,
+          "create Voice session with raw PCM max=128");
+    CHECK(sensor_stream_session_start(session) == SAVVY_OK, "start Voice raw boundary session");
+    sent_capture_t voice_127 = {0}, voice_128 = {0}, voice_129 = {0};
+    CHECK(sensor_stream_session_send_data(session, payload, RAW_MAX - 1u, 12, capture_sent, &voice_127) == SAVVY_OK,
+          "Voice max-1 is accepted");
+    CHECK(sensor_stream_session_send_data(session, payload, RAW_MAX, 12, capture_sent, &voice_128) == SAVVY_OK,
+          "Voice max is accepted");
+    CHECK(sensor_stream_session_send_data(session, payload, RAW_MAX + 1u, 12, capture_sent, &voice_129) == SAVVY_ERR_OVERFLOW,
+          "Voice max+1 is rejected");
+    usleep(500 * 1000);
+    CHECK(voice_127.calls == 1 && voice_127.last_ok, "Voice max-1 completes through production TCP");
+    CHECK(voice_128.calls == 1 && voice_128.last_ok, "Voice max completes through production TCP");
+    CHECK(voice_129.calls == 0, "rejected Voice max+1 has no callback");
+    CHECK(voice_raw.data_count == 2 &&
+          voice_raw.data_lengths[0] == (size_t)SENSOR_WAV_HEADER_LEN + RAW_MAX - 1u &&
+          voice_raw.data_lengths[1] == (size_t)SENSOR_WAV_HEADER_LEN + RAW_MAX,
+          "Voice wire capacity includes the 44-byte WAV expansion at max");
+    CHECK(voice_raw.seen_wav_magic, "Voice max payload is WAV-wrapped on the wire");
+    sensor_stream_session_destroy(session);
+    pthread_join(voice_raw_thread, NULL);
+    close(voice_raw.listen_fd);
+
+    mock_server_t stream_compressed = {0};
+    CHECK(make_listener(&stream_compressed), "create Stream compressed boundary server");
+    stream_compressed.expected_connections = 1;
+    pthread_t stream_compressed_thread;
+    pthread_create(&stream_compressed_thread, NULL, mock_server_thread, &stream_compressed);
+
+    cfg = boundary_config(stream_compressed.port, 1, RAW_MAX);
+    session = NULL;
+    CHECK(sensor_stream_session_create(&session, SENSOR_STREAM_ROLE_STREAM, &cfg, NULL, NULL) == SAVVY_OK,
+          "create compressed Stream session");
+    sensor_stream_session_start(session);
+    sent_capture_t stream_zip = {0};
+    CHECK(sensor_stream_session_send_data(session, payload, RAW_MAX, 0, capture_sent, &stream_zip) == SAVVY_OK,
+          "compressed high-entropy Stream max is accepted");
+    usleep(500 * 1000);
+    CHECK(stream_zip.calls == 1 && stream_zip.last_ok, "compressed Stream max completes");
+    CHECK(stream_compressed.data_count == 1 && stream_compressed.data_commands[0] == (uint8_t)'Z',
+          "compressed Stream uses Command='Z'");
+    CHECK(stream_compressed.data_lengths[0] > RAW_MAX,
+          "compressed high-entropy output larger than raw input fits encoded capacity");
+    sensor_stream_session_destroy(session);
+    pthread_join(stream_compressed_thread, NULL);
+    close(stream_compressed.listen_fd);
+
+    mock_server_t voice_compressed = {0};
+    CHECK(make_listener(&voice_compressed), "create Voice compressed boundary server");
+    voice_compressed.expected_connections = 1;
+    pthread_t voice_compressed_thread;
+    pthread_create(&voice_compressed_thread, NULL, mock_server_thread, &voice_compressed);
+
+    cfg = boundary_config(voice_compressed.port, 1, RAW_MAX);
+    session = NULL;
+    CHECK(sensor_stream_session_create(&session, SENSOR_STREAM_ROLE_VOICE, &cfg, NULL, NULL) == SAVVY_OK,
+          "create compressed Voice session");
+    sensor_stream_session_start(session);
+    sent_capture_t voice_zip = {0};
+    CHECK(sensor_stream_session_send_data(session, payload, RAW_MAX, -12, capture_sent, &voice_zip) == SAVVY_OK,
+          "compressed high-entropy Voice max is accepted");
+    usleep(500 * 1000);
+    CHECK(voice_zip.calls == 1 && voice_zip.last_ok, "compressed Voice max completes");
+    CHECK(voice_compressed.data_count == 1 && voice_compressed.data_commands[0] == (uint8_t)'Z',
+          "compressed Voice uses Command='Z'");
+    CHECK(voice_compressed.data_lengths[0] > RAW_MAX,
+          "compressed Voice WAV output larger than raw PCM fits encoded capacity");
+    sensor_stream_session_destroy(session);
+    pthread_join(voice_compressed_thread, NULL);
+    close(voice_compressed.listen_fd);
+
+    cfg = boundary_config(1, 0, 0);
+    session = NULL;
+    CHECK(sensor_stream_session_create(&session, SENSOR_STREAM_ROLE_STREAM, &cfg, NULL, NULL) == SAVVY_OK,
+          "very small Stream max=0 still reserves a packet header");
+    sensor_stream_session_destroy(session);
+    session = NULL;
+    CHECK(sensor_stream_session_create(&session, SENSOR_STREAM_ROLE_VOICE, &cfg, NULL, NULL) == SAVVY_OK,
+          "very small Voice max=0 still reserves packet plus WAV capacity");
+    sensor_stream_session_destroy(session);
+
+    cfg.max_payload_size = SIZE_MAX;
+    session = NULL;
+    CHECK(sensor_stream_session_create(&session, SENSOR_STREAM_ROLE_STREAM, &cfg, NULL, NULL) == SAVVY_ERR_OVERFLOW && session == NULL,
+          "unencodable Stream config is rejected without allocation");
+    CHECK(sensor_stream_session_create(&session, SENSOR_STREAM_ROLE_VOICE, &cfg, NULL, NULL) == SAVVY_ERR_OVERFLOW && session == NULL,
+          "overflowing Voice WAV config is rejected without allocation");
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s <001|003|003wav|isolation>\n", argv[0]);
+        fprintf(stderr, "usage: %s <001|003|003wav|isolation|boundary>\n", argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "001") == 0) {
@@ -372,6 +539,8 @@ int main(int argc, char **argv)
         test_003_wav();
     } else if (strcmp(argv[1], "isolation") == 0) {
         test_isolation();
+    } else if (strcmp(argv[1], "boundary") == 0) {
+        test_payload_boundaries();
     } else {
         fprintf(stderr, "unknown test id: %s\n", argv[1]);
         return 2;
