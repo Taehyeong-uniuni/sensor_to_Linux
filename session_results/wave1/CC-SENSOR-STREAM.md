@@ -238,3 +238,128 @@ This is not CODEX_VERIFIED.
 This is not MERGE_READY.
 RV1106 cross-build and hardware QA were not performed.
 ```
+
+## 9. Codex Review 1 Fix — CC-SENSOR-STREAM-FIX-1
+
+```text
+STATUS: FIX_IMPLEMENTED
+NEXT: AWAITING_CODEX_REREVIEW
+```
+
+### Review와 기존 입력
+
+- Review file: `session_results/wave1/review/CC-SENSOR-STREAM_CODEX_REVIEW_1.md`
+- Review target: `af2bcf79bf52de0b12f7948ccf6ed67eeae45c70`
+- 처리 Finding: `CDX-W1-SENSOR-STREAM-001`, `CDX-W1-SENSOR-STREAM-002`, `CDX-W1-SENSOR-STREAM-003`
+- `PREEXISTING_FIX_INPUT`: `ACCEPTED`
+- 시작 시 `tests/integration/sensor_stream/session/CMakeLists.txt`는 boundary repro executable을 build하는 변경이었고, `repro_boundary_before.c`는 production session API에 `max_payload_size=128`, Stream/Voice 127·128·129 byte를 넣어 결과를 출력하는 39-line 재현 프로그램이었다. 두 파일에는 Foundation/contract/다른 session 변경이나 외부 접근이 없었다.
+- 시작 SHA-256: CMakeLists `0c71179dfe2714397dd3a46f02af9e241af39f118004d0cb4dc34949e9c6c56e`, repro `f97c465e07999b095353d07b4fdcb274cb8bf558182cbfef1063f2ff01929ef1`.
+- `PREEXISTING_FILES_FINAL_ACTION`: CMakeLists는 정식 `SNS-STR-BOUNDARY-production-session-api` CTest 등록으로 수정했다. print-only untracked `repro_boundary_before.c`는 삭제하고 그 동작을 `tests/integration/sensor_stream/session/test_session.c`의 loopback production-session test로 대체했다. 보존된 behavior는 Stream/Voice 127·128·129 boundary이며, WAV 확장·Stream/Voice compressed high-entropy·compressed output larger than input·작은/overflow config 검증을 추가했다.
+
+### Finding별 수정과 Before/After
+
+| Finding | Before | After |
+|---|---|---|
+| `CDX-W1-SENSOR-STREAM-001` | unquoted normalization이 `malloc(new_len)`만 수행해 Foundation parser의 `text[len]=='\0'` precondition을 위반했고 Linux ASan heap-buffer-overflow가 재현됐다. | quoted/raw와 unquoted/normalized 모두 overflow-checked `len+1` 소유 버퍼로 만들고 마지막 NUL을 기록한다. allocation 실패는 no-op으로 처리하고 parser 호출 후 정확히 한 번 free한다. quoted 4/7, unquoted 4/space/negative, `resultx`, `myresult`, string 내부 `result:`, truncated, empty 및 terminator 없는 counted buffer를 검증했다. Docker ASan+UBSan result policy 6/6 PASS. |
+| `CDX-W1-SENSOR-STREAM-002` | 기존 repro에서 Stream/Voice 127·128·129가 모두 `SAVVY_ERR_OVERFLOW(10)`이었다. raw max와 encoded packet capacity가 같은 값이었다. | raw upper bound를 session에 별도 저장하고 Stream=`26+raw`, Voice=`26+44+raw`, compressed=`26+(input+input/100+600)` capacity를 overflow-safe하게 계산한다. production session API test에서 Stream/Voice max-1·max callback 성공, max+1 synchronous reject, Voice WAV 44-byte 확장, high-entropy compressed 확대 결과를 확인했다. |
+| `CDX-W1-SENSOR-STREAM-003` | mock standalone build의 `ctest -N`은 `Total Tests: 0`; `partial-header`/`split-body`는 request-side fragmentation이었다. | mock build에 production TCP channel을 사용하는 8개 CTest를 등록했다. response header/body 실제 분할, delay, timeout, late response, header/body 중 disconnect, Stream failure/Voice healthy isolation을 ephemeral port와 bounded child wait로 실행하며 child exit 0과 outcome을 검사한다. |
+
+### 수정 파일
+
+```text
+src/features/result_policy/result_policy.c
+src/features/stream/include/sensor_stream/session.h
+src/features/stream/session.c
+tests/integration/sensor_stream/session/CMakeLists.txt
+tests/integration/sensor_stream/session/test_session.c
+tests/unit/sensor_stream/result_policy/test_result_policy.c
+tools/mock_streaming_server/CMakeLists.txt
+tools/mock_streaming_server/mock_streaming_server.c
+tools/mock_streaming_server/test_mock_response.c
+```
+
+`tests/integration/sensor_stream/session/repro_boundary_before.c`는 시작 시 untracked 입력이었으며 위 정식 test로 완전히 대체되어 commit 대상에 남기지 않았다.
+
+### 검증 결과
+
+macOS clean `/tmp` build 최종 결과:
+
+- Plain: 39/39 PASS — Foundation 5, TCP 5, result policy 6, WAV 4, BZip 6, Stream 5, Mock 8.
+- UBSan: 39/39 PASS, diagnostic 없음.
+- `-Wall -Wextra -Wpedantic`: build PASS 및 39/39 PASS.
+- 첫 병렬 3-mode 실행에서 기존 `SNS-STR-006` queue timing test가 Plain 1회 실패했으나, 부하를 제거한 clean sequential 최종 실행에서 TCP 5/5 및 전체 39/39 PASS했다.
+- ASan: `NOT_PERFORMED`. `detect_leaks=1`은 이 macOS runtime에서 unsupported로 본문 전에 abort했고, leak 옵션 제거 후 동일 `SNS-STR-002-unquoted-wire-quirk` process가 출력 없이 CTest 15초 timeout됐다. UBSan과 Docker arm64 ASan+UBSan으로 보완했다.
+
+Ubuntu 22.04 arm64 Docker (`savvy-foundation-test:ubuntu22.04-arm64-v1`, `--network none`, source read-only mount) 최종 결과:
+
+- 환경: Ubuntu 22.04.5 LTS, `aarch64`/64-bit, CMake 3.22.1, GCC 11.4.0, GNU ld 2.38.
+- Plain: 43/43 PASS — Foundation 9, TCP 5, result policy 6, WAV 4, BZip 6, Stream 5, Mock 8.
+- UBSan: 43/43 PASS, diagnostic 없음.
+- ASan+UBSan finding tests: result policy 6/6, production session boundary 1/1, mock response 8/8 PASS.
+- sanitizer arm64 emulation에서 isolation child의 2초 reap limit이 한 번 초과돼 bounded child wait를 5초, CTest timeout을 15초로 보정했고 최종 8/8 PASS했다.
+- system BZip: `libbz2-dev:arm64=1.0.8-5build1`, `libbz2-1.0:arm64=1.0.8-5build1`; `readelf` NEEDED와 `ldd` 모두 `libbz2.so.1.0` 확인.
+- Stream target graph 및 `libsensor_stream_session.a` symbol 검사에서 production test-server dependency/linkage 0.
+
+필수 13 Test ID:
+
+| ID | 결과 |
+|---|---|
+| `CT-PKT-001` | PASS |
+| `CT-PKT-002` | PASS |
+| `CT-PKT-003` | PASS |
+| `SNS-STR-001` | PASS |
+| `SNS-STR-002` | PASS |
+| `SNS-STR-003` | PASS |
+| `SNS-STR-004` | PASS |
+| `SNS-STR-005` | PASS |
+| `SNS-STR-006` | PASS |
+| `SNS-STR-007` | PASS |
+| `SNS-STR-008` | PASS |
+| `SNS-STR-009` | PASS |
+| `SNS-STR-010` | PASS |
+
+추가 CTest는 boundary 1개와 mock response 8개, 총 9개다. 최종 전체 CTest count는 Docker real-IPC build 기준 43개다.
+
+### Ownership와 scope
+
+- session별 encode buffer, TCP worker/socket/queue, result policy ownership은 그대로 유지했다.
+- 기존 timeout 1000/3000ms, queue depth/정책, retry 정책, wire command, JSON field는 변경하지 않았다.
+- Allowed path violation 0, Foundation/contract/root CMake/root `SESSION_RESULT.md`/다른 session diff 0.
+- durable queue 0, disk queue 0, BZip raw fallback 0, production test-server linkage 0.
+- 원본 Review SHA-256 시작/종료: `48b01c72677aae9380a86b96883753809e038bb6968dfd7845a4b896d34f220d` / 동일. Review 파일은 수정·stage·commit하지 않았다.
+
+### Exact SHA Ledger
+
+```text
+CONTRACT_TAG_TARGET_SHA:
+07809cb1f3f2b86a8e92ade661c48cb3adb97b52
+
+FOUNDATION_IMPLEMENTATION_SHA:
+aca143a7f4b76dc8cb6fff324ca21ea9f557622a
+
+CHECKPOINT_SHA:
+212010f5ab62571aa66e72b12b8eea0ed37df944
+
+ORIGINAL_IMPLEMENTATION_SHA:
+af2bcf79bf52de0b12f7948ccf6ed67eeae45c70
+
+CODEX_REVIEW_1_TARGET_SHA:
+af2bcf79bf52de0b12f7948ccf6ed67eeae45c70
+
+FIX_IMPLEMENTATION_SHA:
+5fecfcb15b11f5d93562f4cec2d0ae713acc6674
+
+FIX_REPORT_SHA:
+See the fix completion output.
+
+REREVIEW_TARGET_SHA:
+See the fix completion output.
+```
+
+```text
+RV1106_CROSS_BUILD: NOT_PERFORMED
+RV1106_BOARD_RUNTIME: NOT_PERFORMED
+HARDWARE_QA: NOT_PERFORMED
+CODEX_REREVIEW: NOT_STARTED
+MERGE_READY: NO
+```
