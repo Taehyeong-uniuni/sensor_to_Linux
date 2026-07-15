@@ -39,17 +39,40 @@ savvy_status_t savvy_ipc_cancel_source_init(savvy_ipc_cancel_source_t *cs)
     return SAVVY_OK;
 }
 
-void savvy_ipc_cancel_source_cancel(const savvy_ipc_cancel_source_t *cs)
+/* FINAL-M-02: bounded, not unbounded - EINTR is a transient signal
+ * interruption that can recur, but must not turn a single write() call
+ * into an infinite/busy loop. 16 immediate retries is far more than any
+ * realistic signal-delivery rate would need and still returns promptly
+ * (no blocking, no sleeping between attempts - each attempt is itself
+ * non-blocking) if something is pathologically wrong. */
+#define SAVVY_CANCEL_WRITE_MAX_ATTEMPTS 16
+
+savvy_status_t savvy_ipc_cancel_source_cancel(const savvy_ipc_cancel_source_t *cs)
 {
     if (cs == NULL || cs->write_fd < 0) {
-        return;
+        return SAVVY_ERR_INVALID_ARGUMENT;
     }
-    /* Best-effort, single byte; EAGAIN (pipe already has a pending byte
-     * from an earlier cancel() call) and EINTR are both fine to ignore -
-     * either way, the read end already has (or will shortly have) at
-     * least one byte available, which is all a poll() waiter needs. */
-    ssize_t ignored = write(cs->write_fd, "x", 1);
-    (void)ignored;
+    for (int attempt = 0; attempt < SAVVY_CANCEL_WRITE_MAX_ATTEMPTS; attempt++) {
+        ssize_t n = write(cs->write_fd, "x", 1);
+        if (n == 1) {
+            return SAVVY_OK;
+        }
+        if (n < 0 && errno == EINTR) {
+            /* The byte was NOT written - retry rather than silently
+             * dropping the cancellation request, which would otherwise
+             * leave a waiter blocked with no indication cancel() was ever
+             * called. */
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* The pipe's buffer already holds a byte from an earlier
+             * cancel() call (or this one, raced by another thread) - a
+             * waiter will still see it, so this is success, not failure. */
+            return SAVVY_OK;
+        }
+        return SAVVY_ERR_IO;
+    }
+    return SAVVY_ERR_IO;
 }
 
 void savvy_ipc_cancel_source_destroy(savvy_ipc_cancel_source_t *cs)
@@ -89,9 +112,19 @@ int savvy_ipc_poll_with_deadline_cancelable(int fd, short events, uint32_t timeo
     savvy_deadline_arm(&deadline, timeout_ms);
 
     for (;;) {
-        if (savvy_deadline_expired(&deadline)) {
-            return 0;
-        }
+        /* FINAL-M-01: no pre-check against savvy_deadline_expired() here.
+         * For timeout_ms == 0, the public contract is "perform exactly one
+         * non-blocking readiness check" - but savvy_deadline_expired()
+         * treats a 0ms deadline as expired from the very first instant
+         * (elapsed >= 0 is always true), which used to make this function
+         * return SAVVY_ERR_TIMEOUT unconditionally, even when the fd was
+         * already ready, without ever calling poll() at all. Removing the
+         * pre-check does not change timeout_ms > 0 behavior at all: with
+         * `remaining` computed below and passed straight to poll(), an
+         * already-elapsed deadline still correctly results in
+         * poll(..., 0) - a real, immediate, non-blocking check - which
+         * poll() itself resolves to "not ready" (pr == 0, handled below)
+         * exactly as before. */
         uint32_t remaining = savvy_deadline_remaining_ms(&deadline);
         int clamped = (remaining > (uint32_t)INT_MAX) ? INT_MAX : (int)remaining;
 

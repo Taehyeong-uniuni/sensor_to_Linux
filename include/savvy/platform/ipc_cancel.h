@@ -34,9 +34,20 @@ savvy_status_t savvy_ipc_cancel_source_init(savvy_ipc_cancel_source_t *cs);
 /* Requests cancellation of whatever accept_cancelable()/connect_
  * cancelable() call is (or next becomes) blocked on this source - safe to
  * call from any thread, including one different from whichever thread is
- * blocked. Safe to call more than once; calls after the first are
- * harmless no-ops (the pipe already has a pending byte). Does not block. */
-void savvy_ipc_cancel_source_cancel(const savvy_ipc_cancel_source_t *cs);
+ * blocked. Safe to call more than once; calls after the first observe the
+ * pipe already has a pending byte and report success without writing
+ * another one (FINAL-M-02: EAGAIN/EWOULDBLOCK from the underlying
+ * non-blocking write() is treated as "already pending," not a failure).
+ * A write() interrupted by a signal (EINTR) is retried (bounded - this
+ * does not loop forever) rather than silently dropping the cancel byte,
+ * which would otherwise leave a waiter blocked with no way to know
+ * cancellation was ever requested. Returns SAVVY_OK once the cancel byte
+ * is confirmed pending (written by this call or an earlier one) - a
+ * caller that gets SAVVY_OK back is guaranteed a waiter blocked on `cs`
+ * will wake promptly. Returns SAVVY_ERR_INVALID_ARGUMENT if `cs` is NULL
+ * or already destroyed, or SAVVY_ERR_IO on an unexpected write() failure
+ * or after exhausting the bounded EINTR retry budget. Never blocks. */
+savvy_status_t savvy_ipc_cancel_source_cancel(const savvy_ipc_cancel_source_t *cs);
 
 /* Closes both pipe fds. Call exactly once, only after no
  * accept_cancelable()/connect_cancelable() call is still using *cs. */

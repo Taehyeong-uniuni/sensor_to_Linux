@@ -707,6 +707,32 @@ static void *blocked_connect_thread(void *arg)
 
 static void noop_signal_handler(int sig) { (void)sig; }
 
+/* FINAL-M-02: repeatedly signals a SPECIFIC target thread (pthread_kill,
+ * not a process-directed kill() that the kernel could deliver to any
+ * thread) to try to force EINTR during that thread's in-flight syscalls.
+ * A plain 1-byte pipe write() is normally too fast for external signal
+ * bombardment to land inside its actual syscall window every run - this
+ * cannot GUARANTEE the EINTR branch fires on every execution, only
+ * exercise savvy_ipc_cancel_source_cancel() under sustained concurrent
+ * signal pressure and confirm the end-to-end outcome (cancel byte
+ * delivered, waiter woken) is still correct regardless of whether this
+ * particular run happened to interrupt the write() itself. */
+typedef struct signal_bomber_arg {
+    pthread_t target;
+    volatile int stop;
+} signal_bomber_arg_t;
+
+static void *signal_bomber_thread(void *arg)
+{
+    signal_bomber_arg_t *a = (signal_bomber_arg_t *)arg;
+    struct timespec iv = { 0, 200000L }; /* 0.2ms between signals */
+    for (int i = 0; i < 500 && !a->stop; i++) {
+        pthread_kill(a->target, SIGUSR2);
+        nanosleep(&iv, NULL);
+    }
+    return NULL;
+}
+
 static void test_ipc_004(void)
 {
     /* A: a thread blocked in recv() wakes promptly when another thread
@@ -823,7 +849,8 @@ static void test_ipc_004(void)
         struct timespec settle = { 0, 200000000L };
         nanosleep(&settle, NULL);
 
-        savvy_ipc_cancel_source_cancel(&cancel);
+        savvy_status_t cancel_call_st = savvy_ipc_cancel_source_cancel(&cancel);
+        CHECK("004C1 cancel_source_cancel() itself reports SAVVY_OK", cancel_call_st == SAVVY_OK);
         int joined = join_with_timeout(th, 2000);
         CHECK("004C1 backlog-exhaustion connect attempt never hangs regardless of whether it wins the race "
               "(not after the full 30s timeout)", joined == 0);
@@ -851,8 +878,9 @@ static void test_ipc_004(void)
 
         savvy_ipc_cancel_source_t cancel;
         savvy_status_t cs_st = savvy_ipc_cancel_source_init(&cancel);
-        savvy_ipc_cancel_source_cancel(&cancel); /* cancelled BEFORE the call even starts */
-        CHECK("004C2 cancel source created and pre-cancelled", cs_st == SAVVY_OK);
+        savvy_status_t cancel_call_st = savvy_ipc_cancel_source_cancel(&cancel); /* cancelled BEFORE the call even starts */
+        CHECK("004C2 cancel source created and pre-cancelled",
+              cs_st == SAVVY_OK && cancel_call_st == SAVVY_OK);
 
         savvy_ipc_transport_t transport;
         uint64_t before = wall_ms();
@@ -863,6 +891,66 @@ static void test_ipc_004(void)
               st == SAVVY_ERR_CANCELLED && elapsed < 2000);
 
         savvy_ipc_cancel_source_destroy(&cancel);
+        close(listen_fd);
+        unlink(path);
+    }
+
+    /* C3 (FINAL-M-02): savvy_ipc_cancel_source_cancel()'s write() must not
+     * silently lose the cancel byte if interrupted by a signal (EINTR) -
+     * a lost byte would leave the connect() waiter blocked with no way to
+     * know cancellation was ever requested. A dedicated thread hammers
+     * SIGUSR2 (handler installed without SA_RESTART) at the SAME thread
+     * that calls cancel(), for the duration of that call, to exercise
+     * this under real concurrent signal pressure. Uses the same
+     * backlog-exhaustion setup as 004C1 to give the connect attempt a
+     * genuine chance to still be pending when cancel() is called. */
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        CHECK("004C3 setup: raw server listening", listen_fd >= 0);
+
+        savvy_ipc_transport_t occupying_transport;
+        savvy_status_t occ_st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &occupying_transport);
+        CHECK("004C3 setup: first connect occupies the only backlog slot", occ_st == SAVVY_OK);
+
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = noop_signal_handler;
+        sa.sa_flags = 0; /* explicitly no SA_RESTART */
+        sigaction(SIGUSR2, &sa, NULL);
+
+        savvy_ipc_cancel_source_t cancel;
+        savvy_status_t cs_st = savvy_ipc_cancel_source_init(&cancel);
+        CHECK("004C3 cancel source created", cs_st == SAVVY_OK);
+
+        blocked_connect_result_t result = { path, &cancel, SAVVY_ERR_UNKNOWN };
+        pthread_t connect_th;
+        pthread_create(&connect_th, NULL, blocked_connect_thread, &result);
+        struct timespec settle = { 0, 100000000L };
+        nanosleep(&settle, NULL);
+
+        signal_bomber_arg_t bomber_arg = { pthread_self(), 0 };
+        pthread_t bomber_th;
+        pthread_create(&bomber_th, NULL, signal_bomber_thread, &bomber_arg);
+
+        savvy_status_t cancel_call_st = savvy_ipc_cancel_source_cancel(&cancel);
+        CHECK("004C3 cancel() succeeds despite concurrent signal bombardment of the calling thread "
+              "(EINTR retried, cancel byte never silently lost)", cancel_call_st == SAVVY_OK);
+
+        bomber_arg.stop = 1;
+        pthread_join(bomber_th, NULL);
+
+        int joined = join_with_timeout(connect_th, 2000);
+        CHECK("004C3 waiter never hangs once cancel() has returned success "
+              "(may have already succeeded outright, per 004C1's environment note)", joined == 0);
+        if (joined != 0) {
+            pthread_cancel(connect_th);
+            pthread_join(connect_th, NULL);
+        }
+
+        savvy_ipc_cancel_source_destroy(&cancel);
+        occupying_transport.close(&occupying_transport);
         close(listen_fd);
         unlink(path);
     }
@@ -1024,6 +1112,128 @@ static void test_ipc_004(void)
         unlink(path_c);
         close(listen_fd_a);
         unlink(path_a);
+    }
+
+    /* H (FINAL-M-01): timeout_ms == 0 means "perform exactly one
+     * non-blocking readiness check", not "always report timeout
+     * regardless of actual readiness." The bug was an upfront
+     * deadline-expired pre-check that fired before poll() was ever
+     * called, so an ALREADY-ready descriptor still incorrectly reported
+     * SAVVY_ERR_TIMEOUT. */
+    {
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        savvy_ipc_transport_t transport;
+        savvy_status_t st = savvy_ipc_client_connect(path, TEST_TIMEOUT_MS, &transport);
+        int server_peer_fd = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
+        CHECK("004H setup: connected", st == SAVVY_OK && server_peer_fd >= 0);
+
+        /* H1: data already sent and sitting in the socket buffer before
+         * recv(..., timeout=0) - must succeed immediately. */
+        const char *msg = "{\"action\":\"com.uniuni.savvymgr.fracture.sensor\",\"payload\":{}}";
+        size_t msg_len = strlen(msg);
+        ssize_t sent = send(server_peer_fd, msg, msg_len, 0);
+        struct timespec settle = { 0, 50000000L };
+        nanosleep(&settle, NULL); /* let it genuinely land in the socket buffer */
+        char rx[256]; size_t out_len = 0;
+        st = transport.recv(&transport, rx, sizeof(rx), &out_len, 0);
+        CHECK("004H1 ready recv with timeout=0 succeeds immediately (not a false timeout)",
+              sent == (ssize_t)msg_len && st == SAVVY_OK && out_len == msg_len &&
+              memcmp(rx, msg, msg_len) == 0);
+
+        /* H2: nothing sent - must return SAVVY_ERR_TIMEOUT immediately,
+         * not block. */
+        st = transport.recv(&transport, rx, sizeof(rx), &out_len, 0);
+        CHECK("004H2 not-ready recv with timeout=0 returns SAVVY_ERR_TIMEOUT immediately",
+              st == SAVVY_ERR_TIMEOUT);
+
+        /* H3: default send buffer has room - must succeed immediately. */
+        st = transport.send(&transport, msg, msg_len, 0);
+        char rx2[256];
+        ssize_t n2 = (st == SAVVY_OK) ? recv(server_peer_fd, rx2, sizeof(rx2), 0) : -1;
+        CHECK("004H3 ready send with timeout=0 succeeds immediately and delivers correctly",
+              st == SAVVY_OK && n2 == (ssize_t)msg_len && memcmp(rx2, msg, msg_len) == 0);
+
+        /* H4: send buffer deliberately shrunk and filled, peer never
+         * draining - must return a definite non-blocking status
+         * immediately (SAVVY_ERR_TIMEOUT per the poll-timeout contract, or
+         * SAVVY_ERR_IO if the fill loop itself hit a hard error first). */
+        int fd = (int)(intptr_t)transport.impl;
+        int small_buf = 1024;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small_buf, sizeof(small_buf));
+        char payload[512];
+        memset(payload, 'F', sizeof(payload));
+        savvy_status_t fill_st = SAVVY_OK;
+        for (int i = 0; i < 1000 && fill_st == SAVVY_OK; i++) {
+            fill_st = transport.send(&transport, payload, sizeof(payload), 50u);
+        }
+        CHECK("004H4 setup: send buffer genuinely filled", fill_st != SAVVY_OK);
+        st = transport.send(&transport, payload, sizeof(payload), 0);
+        CHECK("004H4 not-ready send with timeout=0 returns a definite non-blocking status immediately",
+              st == SAVVY_ERR_TIMEOUT || st == SAVVY_ERR_IO);
+
+        close(server_peer_fd);
+        transport.close(&transport);
+        close(listen_fd);
+        unlink(path);
+    }
+    {
+        /* H5/H6: connect's timeout=0 contract (this repo's own role's
+         * analogous "waiting to establish a new transport" operation).
+         * H5: a healthy listener with backlog room - AF_UNIX connects to
+         * such a listener resolve synchronously in the common case, so
+         * this must succeed immediately even with timeout=0 (the
+         * synchronous-completion path doesn't even reach the poll wait
+         * this fix targets, but must still not be broken by it). */
+        char path[108];
+        make_socket_path(path, sizeof(path));
+        int listen_fd = raw_server_listen(path);
+        savvy_ipc_transport_t transport;
+        savvy_status_t st = savvy_ipc_client_connect(path, 0, &transport);
+        CHECK("004H5 ready connect (healthy listener, backlog room) with timeout=0 succeeds immediately",
+              st == SAVVY_OK);
+        int server_peer_fd = -1;
+        if (st == SAVVY_OK) {
+            server_peer_fd = raw_server_accept(listen_fd, (int)TEST_TIMEOUT_MS);
+            transport.close(&transport);
+        }
+        if (server_peer_fd >= 0) {
+            close(server_peer_fd);
+        }
+        close(listen_fd);
+        unlink(path);
+
+        /* H6: not-ready connect with timeout=0, against an exhausted
+         * backlog(1) - per 004C1's own documented environment finding,
+         * this Docker kernel does not reliably keep a second AF_UNIX
+         * connect() pending long enough to observe genuine
+         * not-readiness, so this accepts either a correct immediate
+         * SAVVY_ERR_TIMEOUT (not ready) or SAVVY_OK (the OS resolved it
+         * anyway) - both are a definite, immediate, non-hanging result;
+         * the poll-level not-ready-with-timeout=0 behavior itself is
+         * already proven deterministically by H2/H4 above and by
+         * accept's H6 in the counterpart repo, since all three funnel
+         * through the exact same savvy_ipc_poll_with_deadline_cancelable. */
+        char path2[108];
+        make_socket_path(path2, sizeof(path2));
+        int listen_fd2 = raw_server_listen(path2);
+        savvy_ipc_transport_t occupying_transport;
+        savvy_status_t occ_st = savvy_ipc_client_connect(path2, TEST_TIMEOUT_MS, &occupying_transport);
+        CHECK("004H6 setup: first connect occupies the only backlog slot", occ_st == SAVVY_OK);
+
+        savvy_ipc_transport_t transport2;
+        savvy_status_t st2 = savvy_ipc_client_connect(path2, 0, &transport2);
+        CHECK("004H6 not-ready-or-resolved connect with timeout=0 returns a definite, immediate result "
+              "(no hang) - see comment above for the environment caveat this shares with 004C1",
+              st2 == SAVVY_ERR_TIMEOUT || st2 == SAVVY_OK);
+        if (st2 == SAVVY_OK) {
+            transport2.close(&transport2);
+        }
+
+        occupying_transport.close(&occupying_transport);
+        close(listen_fd2);
+        unlink(path2);
     }
 }
 
