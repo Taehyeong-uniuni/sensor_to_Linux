@@ -257,7 +257,10 @@ static void test_json_001(void)
     }
 }
 
-/* ---- CT-JSON-002: DataResult result semantics ---- */
+/* ---- CT-JSON-002: DataResult result semantics (DEC-20260715-DATARESULT-
+ * GSON-PARITY - see contracts/json_field_policy.md §4 and
+ * data_result_codec.h for the full empirical Gson 2.8.2 matrix this
+ * implements) ---- */
 static void test_json_002(void)
 {
     savvy_data_result_t dr;
@@ -274,6 +277,11 @@ static void test_json_002(void)
     CHECK("002 result=7 parses ok and is non-normal/danger",
           st == SAVVY_OK && dr.result == 7 && !savvy_data_result_is_normal(&dr));
 
+    json = "{\"result\":0}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 explicit result=0 parses ok and is danger (distinct from missing, same outcome)",
+          st == SAVVY_OK && dr.result == 0 && !savvy_data_result_is_normal(&dr));
+
     int others[] = {5, 6, 8, 99};
     int all_ok = 1;
     for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
@@ -286,28 +294,116 @@ static void test_json_002(void)
     }
     CHECK("002 result=5/6/8/99 all parse ok and are all non-normal/danger", all_ok);
 
+    /* DEC-20260715-DATARESULT-GSON-PARITY: missing/null now succeed with
+     * result=0 (danger), matching empirically-observed Gson 2.8.2
+     * behavior (real gson-2.8.2.jar, unsafe/no-constructor allocation
+     * bypassing the `= 4` field initializer) - this REPLACES the
+     * pre-2026-07-15 "parse error" policy. */
     json = "{}";
     st = savvy_data_result_parse(json, strlen(json), &dr);
-    CHECK("002 missing result key -> parse error (never silently 4)", st == SAVVY_ERR_PROTOCOL);
+    CHECK("002 missing result key -> SAVVY_OK, result=0, danger (Gson unsafe-allocation parity)",
+          st == SAVVY_OK && dr.result == 0 && !savvy_data_result_is_normal(&dr));
 
     json = "{\"result\":null}";
     st = savvy_data_result_parse(json, strlen(json), &dr);
-    CHECK("002 null result -> parse error", st == SAVVY_ERR_PROTOCOL);
+    CHECK("002 null result -> SAVVY_OK, result=0, danger (Gson unsafe-allocation parity)",
+          st == SAVVY_OK && dr.result == 0 && !savvy_data_result_is_normal(&dr));
 
+    /* Integer-format numeric strings: Gson coerces these through the same
+     * numeric-token path as an unquoted number (empirically confirmed
+     * against gson-2.8.2.jar). */
     json = "{\"result\":\"4\"}";
     st = savvy_data_result_parse(json, strlen(json), &dr);
-    CHECK("002 string-typed result -> parse error (type mismatch)", st == SAVVY_ERR_PROTOCOL);
+    CHECK("002 numeric string \"4\" -> SAVVY_OK, result=4, normal (Gson string-to-int parity)",
+          st == SAVVY_OK && dr.result == 4 && savvy_data_result_is_normal(&dr));
 
-    json = "{\"result\":4,\"result\":7}";
+    json = "{\"result\":\"7\"}";
     st = savvy_data_result_parse(json, strlen(json), &dr);
-    CHECK("002 duplicate result key -> parse error", st == SAVVY_ERR_PROTOCOL);
+    CHECK("002 numeric string \"7\" -> SAVVY_OK, result=7, danger",
+          st == SAVVY_OK && dr.result == 7 && !savvy_data_result_is_normal(&dr));
+
+    json = "{\"result\":\"-1\"}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 numeric string \"-1\" -> SAVVY_OK, result=-1, danger (G001 additional matrix)",
+          st == SAVVY_OK && dr.result == -1 && !savvy_data_result_is_normal(&dr));
+
+    json = "{\"result\":\"2147483647\"}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 numeric string \"2147483647\" (INT32_MAX) -> SAVVY_OK, result=INT32_MAX "
+          "(G001 additional matrix)",
+          st == SAVVY_OK && dr.result == 2147483647 && !savvy_data_result_is_normal(&dr));
 
     /* F-04/M-06 regression: a fractional result must NOT silently
      * truncate to 4 (normal) - this is the exact case the header's
      * savvy_data_result_parse doc comment calls out. */
     json = "{\"result\":4.9}";
     st = savvy_data_result_parse(json, strlen(json), &dr);
-    CHECK("002 fractional result (4.9) -> parse error, not truncated to 4",
+    CHECK("002 fractional number (4.9) -> parse error, not truncated to 4",
+          st == SAVVY_ERR_PROTOCOL);
+
+    /* G001 additional matrix: a fractional-format numeric STRING fails
+     * the same way as a fractional JSON number - not silently truncated,
+     * not coerced. */
+    json = "{\"result\":\"4.9\"}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 fractional-format string (\"4.9\") -> parse error (G001 additional matrix)",
+          st == SAVVY_ERR_PROTOCOL);
+
+    /* G001 additional matrix: non-numeric string. */
+    json = "{\"result\":\"abc\"}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 non-numeric string (\"abc\") -> parse error (G001 additional matrix)",
+          st == SAVVY_ERR_PROTOCOL);
+
+    /* G001 additional matrix: int32-range overflow, both as a quoted
+     * string and (supplementary confirmatory case, run against the same
+     * JAR to remove an inference gap) as a raw JSON number - neither
+     * wraps/clamps/truncates. */
+    json = "{\"result\":\"2147483648\"}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 out-of-int32-range string (\"2147483648\") -> parse error (G001 additional matrix)",
+          st == SAVVY_ERR_PROTOCOL);
+
+    json = "{\"result\":2147483648}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 out-of-int32-range JSON number (2147483648, unquoted) -> parse error "
+          "(G001 supplementary confirmatory case)",
+          st == SAVVY_ERR_PROTOCOL);
+
+    /* DEC-20260715-DATARESULT-GSON-PARITY: duplicate "result" key is the
+     * one schema-managed object in this codebase where duplicates are NOT
+     * rejected - last occurrence wins (empirically confirmed), tested in
+     * both orders to prove genuine last-wins rather than "not-first-wins". */
+    json = "{\"result\":4,\"result\":7}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 duplicate result key (4 then 7) -> SAVVY_OK, last value 7 wins, danger",
+          st == SAVVY_OK && dr.result == 7 && !savvy_data_result_is_normal(&dr));
+
+    json = "{\"result\":7,\"result\":4}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 duplicate result key (7 then 4) -> SAVVY_OK, last value 4 wins, normal",
+          st == SAVVY_OK && dr.result == 4 && savvy_data_result_is_normal(&dr));
+
+    /* Wrong JSON type for "result": Gson throws for a type-incompatible
+     * target field - object/array/bool all rejected, not coerced. */
+    json = "{\"result\":true}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 boolean result -> parse error", st == SAVVY_ERR_PROTOCOL);
+
+    json = "{\"result\":[4]}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 array result -> parse error", st == SAVVY_ERR_PROTOCOL);
+
+    json = "{\"result\":{}}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 object result -> parse error", st == SAVVY_ERR_PROTOCOL);
+
+    /* Invalid UTF-8: orthogonal to the Gson-parity exception above - still
+     * enforced (via savvy_json_parse_allow_duplicate_keys's own UTF-8
+     * check) even though duplicate-key rejection is not. */
+    json = "{\"result\":4,\"junk\":\"x\xc3\"}";
+    st = savvy_data_result_parse(json, strlen(json), &dr);
+    CHECK("002 invalid UTF-8 elsewhere in the object -> parse error",
           st == SAVVY_ERR_PROTOCOL);
 }
 

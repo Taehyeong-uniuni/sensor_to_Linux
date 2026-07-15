@@ -1,7 +1,6 @@
 #include "ipc_transport_common.h"
 #include "savvy/protocol/ipc_envelope.h" /* SAVVY_IPC_MAX_MESSAGE */
 #include "savvy/core/clock.h"
-#include "savvy/platform/ipc_test_hooks.h"
 #include <sys/socket.h>
 #include <unistd.h>
 #include <string.h>
@@ -11,8 +10,15 @@
 #include <limits.h>
 #include <fcntl.h>
 
-/* TC-H-01: NULL in every non-test build and whenever no test has an
- * override installed - see ipc_test_hooks.h. */
+#ifdef SAVVY_IPC_TEST_HOOKS
+#include "ipc_test_hooks.h"
+
+/* TC-H-01: NULL whenever no test has an override installed - see
+ * ipc_test_hooks.h. FG-M-01: this whole block, including the
+ * savvy_test_poll_override symbol itself, exists ONLY when
+ * SAVVY_IPC_TEST_HOOKS is defined, which src/platform/linux/ipc/
+ * CMakeLists.txt only does when SAVVY_BUILD_TESTS is ON - a production
+ * build has neither the symbol nor this indirection at all. */
 savvy_poll_fn_t savvy_test_poll_override = NULL;
 
 static int savvy_do_poll(struct pollfd *fds, nfds_t nfds, int timeout)
@@ -22,6 +28,12 @@ static int savvy_do_poll(struct pollfd *fds, nfds_t nfds, int timeout)
     }
     return poll(fds, nfds, timeout);
 }
+#else
+static int savvy_do_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+    return poll(fds, nfds, timeout);
+}
+#endif
 
 savvy_status_t savvy_ipc_cancel_source_init(savvy_ipc_cancel_source_t *cs)
 {

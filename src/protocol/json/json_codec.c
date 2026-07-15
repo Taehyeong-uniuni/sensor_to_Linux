@@ -178,3 +178,30 @@ savvy_status_t savvy_json_parse(const char *text, size_t len, cJSON **out_root)
     *out_root = root;
     return SAVVY_OK;
 }
+
+savvy_status_t savvy_json_parse_allow_duplicate_keys(const char *text, size_t len, cJSON **out_root)
+{
+    if (text == NULL || out_root == NULL) {
+        return SAVVY_ERR_INVALID_ARGUMENT;
+    }
+    if (text[len] != '\0') {
+        return SAVVY_ERR_INVALID_ARGUMENT;
+    }
+    if (memchr(text, '\0', len) != NULL) {
+        return SAVVY_ERR_PROTOCOL;
+    }
+
+    const char *parse_end = NULL;
+    cJSON *root = cJSON_ParseWithOpts(text, &parse_end, 1);
+    if (root == NULL) {
+        return SAVVY_ERR_PROTOCOL;
+    }
+
+    if (savvy_json_check_utf8(root) != SAVVY_OK) {
+        cJSON_Delete(root);
+        return SAVVY_ERR_PROTOCOL;
+    }
+
+    *out_root = root;
+    return SAVVY_OK;
+}

@@ -37,7 +37,7 @@
 #include "savvy/platform/ipc_client.h"
 #include "savvy/platform/ipc_reconnect.h"
 #include "savvy/platform/ipc_cancel.h"
-#include "savvy/platform/ipc_test_hooks.h"
+#include "ipc_test_hooks.h" /* FG-M-01: private test-only seam, see tests/contract/CMakeLists.txt */
 #include "savvy/protocol/ipc_envelope.h"
 #include "savvy/protocol/ipc_action_catalog.h"
 

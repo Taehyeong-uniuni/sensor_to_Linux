@@ -30,6 +30,17 @@ extern "C" {
  * On success, caller owns *out_root and must cJSON_Delete() it. */
 savvy_status_t savvy_json_parse(const char *text, size_t len, cJSON **out_root);
 
+/* DataResult-Gson-parity exception ONLY (DEC-20260715-DATARESULT-GSON-
+ * PARITY) - identical to savvy_json_parse() (NUL-terminator / embedded-NUL
+ * checks, cJSON_ParseWithOpts, UTF-8 validation) EXCEPT it does NOT reject
+ * duplicate keys. Every other schema-managed object (envelope root,
+ * payload, jsonConfigDto, jsonDeviceDto) MUST keep using savvy_json_parse()
+ * and its unconditional duplicate-key rejection - this function exists
+ * solely so src/protocol/json/data_result_codec.c can apply DataResult's
+ * own last-value-wins duplicate-key policy, matching observed Gson 2.8.2
+ * behavior. Do not call this from any other codec. */
+savvy_status_t savvy_json_parse_allow_duplicate_keys(const char *text, size_t len, cJSON **out_root);
+
 /* Returns SAVVY_OK if no object in `node`'s subtree (node included) has a
  * duplicate key; SAVVY_ERR_PROTOCOL otherwise. Recurses into nested
  * objects and arrays. NULL is treated as SAVVY_OK (nothing to check). */

@@ -16,6 +16,9 @@ add_test(NAME CT-JSON-002 COMMAND test_json 002)
 if(SAVVY_IPC_REAL_TRANSPORT)
     add_executable(test_ipc test_ipc.c)
     target_link_libraries(test_ipc PRIVATE savvy_platform_ipc savvy_platform_interfaces savvy_protocol savvy_core)
+    # FG-M-01: ipc_test_hooks.h is a private test-only seam, not a public
+    # header - this is the ONLY target allowed to see it.
+    target_include_directories(test_ipc PRIVATE ${CMAKE_SOURCE_DIR}/src/platform/linux/ipc)
 
     add_test(NAME CT-IPC-001 COMMAND test_ipc 001)
     add_test(NAME CT-IPC-002 COMMAND test_ipc 002)
