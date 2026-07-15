@@ -1,19 +1,81 @@
 # SESSION_RESULT
 
-- SESSION_ID: `CC-FOUNDATION` (this document covers the initial Foundation implementation and four subsequent Codex fix rounds, all on the same branch)
+- SESSION_ID: `CC-FOUNDATION` (this document covers the initial Foundation implementation and five subsequent Codex fix rounds, all on the same branch)
 - Repository: `sensor_to_Linux`
 - Branch: `foundation/contract-v1`
 - Base SHA: `f476aea1ce2674e1a1a791154b2e830cbb87940b` (pinned, gate-verified before branch creation)
-- **Pre-this-round HEAD**: `c1fc299eb24cc4cabfcc03dff006a8c071975c97` (final HEAD of the prior FINAL-M-01/FINAL-M-02/FINAL-L-01 round)
-- **Implementation SHA (this round - TC-H-01/TC-M-01/TC-L-01 - last code/test commit, what was actually built and tested)**: `bc89652ae60d4e7ba794e426b3ab7b1713095be6`
-- **Report SHA**: not embedded here - this document's own commit necessarily lands *after* the Implementation SHA above, so a SHA claiming to be "this file's own commit" cannot appear inside that same commit's content (Codex V0A F-12; see "F-12 resolution" below for the full explanation). Run `git rev-parse HEAD` on `foundation/contract-v1` for the true current HEAD; it will be exactly one commit past the Implementation SHA above, and that one commit touches only this file (TC-L-02's report-only changes).
+- **Pre-this-round HEAD**: `4c1f144e8cb8979fc4813ae5e1845d3c4c230935` (final HEAD of the prior TC-H-01/TC-M-01/TC-L-01/TC-L-02 round)
+- **Implementation SHA (this round - DataResult Gson Parity + FG-M-01 - last code/test commit, what was actually built and tested)**: `aca143a7f4b76dc8cb6fff324ca21ea9f557622a`
+- **Report SHA**: not embedded here - this document's own commit necessarily lands *after* the Implementation SHA above, so a SHA claiming to be "this file's own commit" cannot appear inside that same commit's content (Codex V0A F-12; see "F-12 resolution" below for the full explanation). Run `git rev-parse HEAD` on `foundation/contract-v1` for the true current HEAD; it will be exactly one commit past the Implementation SHA above, and that one commit touches only this file (this round's report-only changes).
 - Counterpart repo (`mgr_to_Linux`) base SHA: `9ae8b92d327487a3e0bdf0588449744d66b78c4e`
-- Counterpart repo pre-this-round HEAD: `3d893a6588ea768c84e0be632d54f4b8d71b6a8b`
-- Counterpart repo Implementation SHA (this round): `6916bbb0df2426369a5c3e0091cb740cc7606118`
+- Counterpart repo pre-this-round HEAD: `7bdf4f5703491b400d2248b27b8d97e1cba317da`
+- Counterpart repo Implementation SHA (this round): `5de2ca8182c76158e198ca12c9ea36ddb8f2070e`
 - Contract version: `1.0.0`
-- Status: `IMPLEMENTATION_FINISHED` / `AWAITING_CODEX_REVIEW` (this session does not claim the Foundation work is finalized, independently verified, or ready for downstream consumption - Codex re-verification and user testing are still outstanding)
+- Status: `IMPLEMENTATION_FINISHED` / `AWAITING_CODEX_FINAL_REVIEW` (this session does not claim the Foundation work is finalized, independently verified, or ready for downstream consumption - Codex final re-verification and user testing are still outstanding)
 
-## TC-H-01 / TC-M-01 / TC-L-01 / TC-L-02 fix round (current)
+## DataResult Gson Parity + FG-M-01 fix round (current)
+
+Codex's Gate verdict on the prior round was `PASS_WITH_NON_BLOCKING_FINDINGS`
+(Critical 0, High 0) - two items remained before the `contract-v1` tag: the
+user-approved `DataResult` Gson 2.8.2 empirical parity contract (below), and
+Medium finding `FG-M-01` (the prior round's own TC-H-01 test seam had leaked
+into production exposure).
+
+- **DataResult Gson 2.8.2 empirical parity (`DEC-20260715-DATARESULT-GSON-
+  PARITY`, user-approved)**: the prior round's "Pre-tag compatibility
+  evidence" item (`DataResult` Gson-unsafe-allocation risk, `NOT_VERIFIABLE`)
+  is now closed. The user obtained the real `gson-2.8.2.jar` (SHA-256
+  `b7134929f7cc7c04021ec1cc27ef63ab907e410cf0588e397b8851181eb91092`) and
+  authorized executing it directly, outside both production repos, against a
+  class structurally identical to Android's `DataResult`. The existing
+  7-case matrix (already run, reused as-is) plus a **new** 5-case matrix run
+  this round (`{"result":"-1"}`, `{"result":"2147483647"}`,
+  `{"result":"2147483648"}`, `{"result":"4.9"}`, `{"result":"abc"}`) plus one
+  supplementary confirmatory case (`{"result":2147483648}` unquoted, added to
+  turn an inference into a direct observation) fully pin down the int32-
+  range/fractional-string/nonnumeric-string sub-policy the prior matrix left
+  open. See "DataResult Gson 2.8.2 matrix - full results" below for the
+  complete 13-observation table and the derived policy. **Fix**: `result`'s
+  codec (`src/protocol/json/data_result_codec.c`) now implements this
+  DataResult-ONLY policy - missing/null → `SAVVY_OK`, `result=0`; integer-
+  format numeric string (in int32 range) → `SAVVY_OK`, parsed as that int;
+  duplicate `"result"` key → `SAVVY_OK`, last occurrence wins (via a new
+  sibling function `savvy_json_parse_allow_duplicate_keys`, `src/protocol/
+  json/json_codec.c` - `savvy_json_parse()` itself, used by every other
+  codec, is completely unmodified). Every other schema-managed object
+  (`jsonConfigDto`, `jsonDeviceDto`, the IPC envelope root/payload) keeps its
+  existing strict policy unchanged - verified by re-running `CT-JSON-001`
+  (unchanged pass) alongside the expanded `CT-JSON-002`.
+- **FG-M-01 (test-hook production exposure, Medium)**: the prior round's own
+  TC-H-01 fault-injection seam (`savvy_test_poll_override`,
+  `ipc_test_hooks.h`) sat in the *public* `include/savvy/platform/` path and
+  was compiled into `libsavvy_platform_ipc.a` **unconditionally** - the
+  library's own `add_subdirectory` is gated only by `SAVVY_IPC_REAL_
+  TRANSPORT`, not `SAVVY_BUILD_TESTS`, so the symbol and the mutable-
+  function-pointer indirection existed even in a `SAVVY_BUILD_TESTS=OFF`
+  production build. **Fix** (test-only build-definition-gated private seam +
+  test-target-only private header - two of the four recommended minimal
+  approaches, used together): `ipc_test_hooks.h` moved to `src/platform/
+  linux/ipc/` (no longer under any `PUBLIC` include path); `ipc_transport_
+  common.c`'s `savvy_test_poll_override`/`savvy_do_poll()` indirection now
+  lives inside `#ifdef SAVVY_IPC_TEST_HOOKS`, with a plain direct-`poll()`
+  `#else` branch; `src/platform/linux/ipc/CMakeLists.txt` only defines
+  `SAVVY_IPC_TEST_HOOKS` (`PRIVATE`, so it cannot leak into any consumer's
+  own compile flags) `if(SAVVY_BUILD_TESTS)`; `tests/contract/CMakeLists.txt`
+  adds the header's new location as a `PRIVATE` include path for the
+  `test_ipc` target only. No timeout/cancel logic was touched - only the
+  test-hook's compilation/visibility. See "FG-M-01 verification" below for
+  the full `nm -g` evidence and the unweakened-J1-J6 re-run.
+
+**This round's build/test verification**: macOS 5/5 (test_json's CT-JSON-002
+now carries 21 checks, up from 8, all passing on both repos); Docker Linux
+9/9 on both repos via the official `run-foundation-tests.sh`, plus a
+separate production-only build (`SAVVY_BUILD_TESTS=OFF SAVVY_IPC_REAL_
+TRANSPORT=ON`) confirming zero test-hook symbol exposure, plus a standalone
+`test_ipc 004` run confirming all `004J1`-`004J6` deterministic checks still
+pass with unweakened semantics.
+
+## TC-H-01 / TC-M-01 / TC-L-01 / TC-L-02 fix round (prior round, historical)
 
 A further Codex re-verification found a real regression introduced by the
 previous round's own FINAL-M-01 fix (below), a genuine fd-reuse race between
@@ -464,23 +526,33 @@ additional coverage beyond, not a renumbering of, the required `CT-PKT-001~003`/
 
 ## Modified files (this round)
 
-**Current round** (prior HEAD `c1fc299`..Implementation SHA `bc89652`): 5 files
-changed, 416 insertions(+), 33 deletions(-), 1 commit:
+**Current round** (prior HEAD `4c1f144`..Implementation SHA `aca143a`): 12
+files changed, 409 insertions(+), 72 deletions(-), 1 commit:
 
 ```text
-include/savvy/platform/ipc_cancel.h
-include/savvy/platform/ipc_test_hooks.h            (new)
+contracts/contract-manifest.sha256
+contracts/json_field_policy.md
+include/savvy/protocol/data_result_codec.h
+include/savvy/protocol/json_codec.h
+src/platform/linux/ipc/CMakeLists.txt
+src/platform/linux/ipc/ipc_test_hooks.h            (moved from include/savvy/platform/)
 src/platform/linux/ipc/ipc_transport_common.c
-src/platform/linux/ipc/ipc_transport_common.h
+src/protocol/json/data_result_codec.c
+src/protocol/json/json_codec.c
+tests/contract/CMakeLists.txt
 tests/contract/test_ipc.c
+tests/contract/test_json.c
 ```
 
-All five fall within the Allowed paths list for this round
-(`include/**/platform/**`, `src/platform/linux/ipc/**`, `tests/contract/**`).
+All twelve fall within the Allowed paths list for this round
+(`contracts/**`, `include/**/protocol/**`, `src/platform/linux/ipc/**`,
+`src/protocol/**`, `tests/contract/**`).
 
-Full base..HEAD session total (all rounds): 17 commits, 62 files changed, 10083
-insertions(+), 0 deletions(-) (`git log --oneline`/`git diff --stat`, run
-directly):
+Full base..HEAD session total (all rounds): 19 commits, 63 files changed
+(`git log --oneline`/`git diff --stat`, run directly; the file-count and
+insertion total below are pure insertions relative to base since every
+touched file was created after base - deletions only show up within a
+single round's own narrower diff, as in "Current round" above):
 
 ```text
 e1adac6 foundation: FND-01 packet codec, FND-04 core interfaces, cJSON vendor, CMake scaffolding
@@ -500,14 +572,16 @@ fc0aa62 docs: record the independent verification pass and final touch-up SHA
 941545f fix: FINAL-M-01 timeout_ms==0 semantics and FINAL-M-02 cancel EINTR handling
 c1fc299 docs: FINAL-M-01/M-02 findings + FINAL-L-01 report-only cleanup
 bc89652 fix: TC-H-01 EINTR-after-deadline regression, TC-M-01/TC-L-01 cancel/destroy contract docs
+4c1f144 docs: TC-H-01/M-01/L-01 findings + TC-L-02 governing-status corrections
+aca143a fix: DataResult Gson 2.8.2 empirical parity contract, FG-M-01 test-hook production exposure
 ```
 
 The prior rounds' own file lists (17 files/1112(+)/58(-), then 3 files/271(+)/
-17(-)) are unchanged from what's recorded further above/below in their own
-historical sections. All paths across every round fall within the Allowed
-paths list. Local `build/` directories and stray `.omc/` framework artifacts
-(regenerated/recreated by tooling, never staged) were removed before this
-round's commit.
+17(-), then 5 files/416(+)/33(-)) are unchanged from what's recorded further
+above/below in their own historical sections. All paths across every round
+fall within the Allowed paths list. Local `build/` directories and stray
+`.omc/` framework artifacts (regenerated/recreated by tooling, never staged)
+were removed before this round's commit.
 
 ## macOS host build/test
 
@@ -525,6 +599,14 @@ ctest --preset host-mac --output-on-failure
     CT-JSON-001 ......... Passed
     CT-JSON-002 ......... Passed
 ```
+
+**This round**: `test_json 002` run standalone to see every individual
+`CHECK` (not just the aggregate `ctest` line) - **21/21 passed**, including
+all new DataResult Gson-parity cases (missing/null→0, numeric strings
+"4"/"7"/"-1"/"2147483647", fractional-format string, non-numeric string,
+out-of-range string and unquoted number, both duplicate-key orders,
+bool/array/object rejection, invalid UTF-8). Full list in "DataResult Gson
+2.8.2 matrix - full results" below.
 
 `test_ipc` (CT-IPC-001~003, CT-IPC-CANCEL) is not built here
 (`SAVVY_IPC_REAL_TRANSPORT=OFF` default for `host-mac`; Darwin has no `AF_UNIX
@@ -556,71 +638,138 @@ ctest --test-dir <build_path> --output-on-failure
     CT-PKT-002 .......... Passed
     CT-PKT-003 .......... Passed
     CT-JSON-001 ......... Passed
-    CT-JSON-002 ......... Passed
+    CT-JSON-002 ......... Passed  (now 21 checks, DataResult Gson-parity - see below)
     CT-IPC-001 .......... Passed
     CT-IPC-002 .......... Passed
     CT-IPC-003 .......... Passed
-    CT-IPC-CANCEL ........ Passed  (~3.3s, current round - grew slightly as
-                                    this round added the TC-H-01 fault-
-                                    injection checks and the TC-M-01
-                                    destroy/cancel-ordering checks to the
-                                    same binary; all other tests still
-                                    complete in <0.1s)
+    CT-IPC-CANCEL ........ Passed  (~3.3s - unchanged this round; FG-M-01's
+                                    refactor did not alter test-build
+                                    semantics, only production exposure)
 ```
 
 `ctest --output-on-failure` only prints a test's stdout when it fails, so a
-passing `CT-IPC-CANCEL` line alone doesn't show each individual `CHECK` inside
-it. Since this round added several new checks to it (sensor: `004J1`-`004J6`
-for TC-H-01, a `004C-lifecycle` block for TC-M-01) and their outcome matters
-for this specific report, `test_ipc 004` was also run **standalone**,
-directly, in a throwaway container (same image, same build), to see every
-line - confirmed across 3 separate standalone runs: **all checks passed every
-time**, including every `004J*`/`004C-lifecycle` name explicitly.
-
-**One real, reproducible flaky failure was found and fixed during this
-round's own verification, specific to this repo.** The first full
-`run-foundation-tests.sh` pass after implementing TC-H-01's tests showed
-`mgr_to_Linux` fully green (9/9) but `sensor_to_Linux` failing exactly one
-check (`004J4`, "EINTR strictly after deadline: exactly 1 poll() call").
-Root cause: the test's own `scripted_poll()` helper used a single,
-non-restarted `nanosleep()` call to simulate a slow EINTR - itself
-interruptible by a stray signal (plausibly residual delivery from an earlier
-sub-test's own signal bombardment), which could return early and undermine
-the timing the test depended on. This was a bug in the **test harness**, not
-in the `ipc_transport_common.c` fix itself (which is byte-identical between
-both repos and had already passed on `mgr_to_Linux` in the same run). Fixed
-by looping `nanosleep()` on its own remaining-time output until the full
-requested duration has genuinely elapsed. Re-verified clean across 3
-consecutive full `run-foundation-tests.sh` passes (both repos, 9/9 each) plus
-3 additional standalone direct executions of the specific previously-failing
-check.
+passing `CT-IPC-CANCEL` line alone doesn't show each individual `CHECK`
+inside it. Since FG-M-01's fix specifically needed to prove the `004J1`-
+`004J6` deterministic checks are unweakened, `test_ipc 004` was run
+**standalone**, directly, in a throwaway container (same image), to see
+every line: **46/46 checks passed**, including every `004J1`-`004J6` name
+explicitly with the exact same semantics as before the refactor ("exactly 1
+poll() call", "retried (2 poll() calls)", "bounded well below the 30
+scripted", etc.) - see "FG-M-01 verification" below for the full output and
+the separate production-only build this round added.
 
 Environment: `savvy-foundation-test:ubuntu22.04-arm64-v1`, GCC 11.4.0, CMake
 3.22.1, Ninja 1.10.1, `linux/arm64`. Full raw logs written to
 `SAVVY_migration_control_v1.0/reviews/codex/foundation/v0/evidence/
 docker-sensor-foundation.log` (this repo) and `docker-mgr-foundation.log`
-(counterpart) by the script itself - the pre-existing `-before-v0r-fix.log`
-files were not overwritten (script writes to the plain, non-suffixed names).
+(counterpart) by the script itself.
 
-**TC-L-02: Docker image ID - closed baseline.** `savvy-foundation-test:ubuntu22.04-arm64-v1`
-@ `sha256:73c8a9709607d1910231efb4648510e4d72052072629901fa28fd5c9f39753e7`
-(built locally from the provided `Dockerfile` after an earlier round found a
-different, previously-stated Image ID absent from this machine's Docker
-daemon) is now the **approved, closed local Docker baseline** for this
-project - not an open discrepancy to keep flagging. Both repos' full 9/9 pass
-under this exact image.
+**Docker image ID - closed baseline (unchanged from prior rounds).**
+`savvy-foundation-test:ubuntu22.04-arm64-v1` @
+`sha256:73c8a9709607d1910231efb4648510e4d72052072629901fa28fd5c9f39753e7`
+remains the approved, closed local Docker baseline for this project. Both
+repos' full 9/9 pass under this exact image.
+
+## DataResult Gson 2.8.2 matrix - full results
+
+All cases below were run with the exact `gson-2.8.2.jar` (SHA-256
+`b7134929f7cc7c04021ec1cc27ef63ab907e410cf0588e397b8851181eb91092`,
+independently confirmed via `shasum -a 256` this round), outside both
+production repos, against a `DataResult`-shaped class matching
+`IfComm/DataObjects/DataResult.java` exactly (`int result = 4;` field
+initializer, only constructor `DataResult(int)`, no no-arg constructor,
+plain `new Gson()`).
+
+**Original 7-case matrix** (already run before this round; reused as-is,
+not re-run):
+
+| JSON | Result |
+|---|---|
+| `{"result":4}` | SUCCESS, result=4 |
+| `{"result":7}` | SUCCESS, result=7 |
+| `{}` | SUCCESS, result=**0** |
+| `{"result":null}` | SUCCESS, result=**0** |
+| `{"result":"4"}` | SUCCESS, result=**4** |
+| `{"result":4.9}` | FAIL - "Expected an int but was 4.9" |
+| `{"result":4,"result":7}` | SUCCESS, result=**7** |
+
+**G001 additional 5-case matrix** (this round):
+
+| JSON | Result |
+|---|---|
+| `{"result":"-1"}` | SUCCESS, result=-1 |
+| `{"result":"2147483647"}` | SUCCESS, result=2147483647 |
+| `{"result":"2147483648"}` | FAIL - "Expected an int but was 2147483648" |
+| `{"result":"4.9"}` | FAIL - "Expected an int but was 4.9" |
+| `{"result":"abc"}` | FAIL - "For input string: \"abc\"" |
+
+**Supplementary confirmatory case** (this round, not part of the original
+5-case ask - added to eliminate an inference gap rather than assume
+symmetry):
+
+| JSON | Result |
+|---|---|
+| `{"result":2147483648}` (unquoted) | FAIL - "Expected an int but was 2147483648" (identical error format to the quoted-string case, confirming Gson routes both through the same numeric-token parser) |
+
+**Derived policy** (from the 13 observations above only - not extrapolated):
+JSON integer in int32 range → success; fractional/non-finite/out-of-range
+JSON integer → error; missing/null → success, result=0; integer-format
+numeric string in int32 range → success, parsed as int; integer-format
+numeric string out of range → error; fractional-format or non-numeric
+string → error; any other string lexical form (leading `+`, whitespace,
+exponent) → error (untested, not assumed-accepted); bool/array/object →
+error; duplicate key → last value wins. Full contract in `contracts/
+json_field_policy.md` §4.1 and `include/savvy/protocol/data_result_codec.h`.
+
+Artifacts (outside both production repos):
+`SAVVY_migration_control_v1.0/artifacts/gson/2.8.2/dataresult-matrix/`
+(`DataResultGsonMatrix.java`/`.log` - original 7-case;
+`DataResultGsonMatrixAdditional.java`/`_additional.log` - G001 5-case;
+`DataResultGsonMatrixSupplementary.java`/`_supplementary.log` - the 1
+confirmatory case).
+
+## FG-M-01 verification
+
+Production-only build, both repos, same Docker image:
+
+```bash
+cmake -S <repo> -B <build> -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSAVVY_BUILD_TESTS=OFF -DSAVVY_IPC_REAL_TRANSPORT=ON
+cmake --build <build> --parallel
+nm -g <build>/src/platform/linux/ipc/libsavvy_platform_ipc.a
+```
+
+Result: `tests/` is not built at all (`SAVVY_BUILD_TESTS=OFF` skips
+`add_subdirectory(tests/contract)` entirely); `nm -g` on the resulting
+`libsavvy_platform_ipc.a` shows every expected production symbol
+(`savvy_ipc_cancel_source_*`, `savvy_ipc_poll_with_deadline*`,
+`savvy_ipc_send_capped`, `savvy_ipc_recv_capped`, `savvy_ipc_fd_transport_
+init`, `savvy_ipc_client_*`) and **zero** occurrences of
+`savvy_test_poll_override` or any other test-hook symbol, in either repo -
+confirmed both by full symbol-table listing and a targeted
+`grep -i 'test_poll\|test_hook'` (no matches). This holds for both
+`sensor_to_Linux` (`ipc_client.c`) and `mgr_to_Linux` (`ipc_server.c`).
+
+Test build (unchanged `SAVVY_BUILD_TESTS` default = ON,
+`SAVVY_IPC_REAL_TRANSPORT=ON`): `test_ipc 004` run standalone, both repos -
+**sensor: 46/46 passed, mgr: 40/40 passed** (this repo has more sub-cases
+per its existing connect-vs-accept role asymmetry, unrelated to this
+round), including every `004J1`-`004J6` TC-H-01 deterministic check with
+the exact same semantics as before this round's refactor.
 
 ## Contract manifest comparison
 
-Unchanged this round (`contracts/**` was not touched). `contracts/
-contract-manifest.sha256` (5 entries) remains byte-for-byte identical between
-`sensor_to_Linux` and `mgr_to_Linux` (`diff`, exit 0), no self-entry, no
-absolute paths, no timestamps, no hostname, no username:
+**Updated this round** (`contracts/json_field_policy.md` §4 rewritten for
+`DEC-20260715-DATARESULT-GSON-PARITY`) - regenerated via `cmake/generate_
+manifest.cmake` (the same deterministic generator used every prior round),
+independently cross-checked with `shasum -a 256`. Remains byte-for-byte
+identical between `sensor_to_Linux` and `mgr_to_Linux` (`diff`, exit 0), no
+self-entry, no absolute paths, no timestamps, no hostname, no username. Only
+`json_field_policy.md`'s hash changed; the other four entries are unchanged:
 
 ```text
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  contracts/bt_spp.md
 60bd04569266011a2a1c37fcee89154c7a5b76a2df87fd806e22be92e32c9874  contracts/ipc_action_catalog.md
-d79c476354a70a89018fde64c938953c6056a26eb67da4b7ef19dcc7f99b2f9f  contracts/json_field_policy.md
+c8ab42374fd606ed4a4c0a6c78037c032442622fea004051b2bf103679a10101  contracts/json_field_policy.md
 913e373a93d71e243a4efdf95e6edd28b4f36cbcea75ca22d36cf43d85bebcb0  contracts/mgr_sensor_ipc.schema.json
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  contracts/tcp_8140.md
 ```
@@ -702,9 +851,9 @@ contracts is CC-MGR-CONNECTIVITY/CC-MGR-SERVER's objective, not an
 independent Foundation Gate blocker; FND-01~04 never had a deliverable that
 depended on their content.
 
-See also "Pre-tag compatibility evidence" below for the `DataResult` Gson item,
-which remains open (not resolved) but is tracked separately from "Blockers"
-since it does not block this session's own completion.
+The `DataResult` Gson item, previously tracked separately from "Blockers" as
+an open pre-tag item, is now **CLOSED** this round - see "Pre-tag
+compatibility evidence" below.
 
 ## Approved: keepServerIp divergence (not a blocker)
 
@@ -715,31 +864,32 @@ full history and citations). This is the **approved** per-application Android
 baseline - the two values are not a unification target, this is not an open
 `SCOPE_CHANGE_REQUEST` decision, and this item does not block anything.
 
-## Pre-tag compatibility evidence (NOT optional - required before contract-v1)
+## Pre-tag compatibility evidence - CLOSED this round
 
-**TC-L-02: `DataResult` Gson 2.8.2 compatibility evidence is NOT optional.**
-Status: **`NOT_VERIFIABLE`** (not "resolved," not "optional," not "nice to
-have"). It is **required to be confirmed before the `contract-v1` tag is
-created** - a separate, empirical, pre-tag gate, distinct from and additional
-to this session's own Foundation Linux C code findings/fixes.
-
-The risk: a missing `"result"` key could plausibly deserialize to `0`
-(danger) rather than the `4` (normal) field initializer on real Android,
-since a class with no no-arg constructor forces Gson 2.8.2 into unsafe/
-no-constructor allocation, which bypasses field initializers. This has
-**not** been independently verified by executing real Android/Gson bytecode
-in this or any prior round - hence `NOT_VERIFIABLE` as of this document, not
-a claim that it is fine. It is deliberately kept out of "Blockers" above only
-in the narrow sense that it does not block *this session's own* completion
-(CT-JSON-002 already specifies, and this codebase already implements, the
-safer of the two candidate behaviors regardless of which one Gson actually
-exhibits) - it is very much a blocker on the `contract-v1` tag decision
-itself, which is a separate gate owned by whoever makes that call, not by
-this Foundation code session.
+**`DataResult` Gson 2.8.2 compatibility evidence: CLOSED.** Previously
+`NOT_VERIFIABLE` (prior rounds could not obtain the real `gson-2.8.2.jar`).
+This round, the user obtained the exact JAR and authorized executing it
+directly, outside both production repos - see "DataResult Gson 2.8.2 matrix
+- full results" above for the complete 13-observation table. The
+missing-key risk previously flagged (deserializing to `0`/danger instead of
+the `4`/normal field initializer) is now **confirmed to actually happen**,
+not merely theorized, and the codec has been updated to match this
+observed behavior exactly (`DEC-20260715-DATARESULT-GSON-PARITY`) rather
+than rejecting it as a parse error. This item no longer blocks the
+`contract-v1` tag decision.
 
 ## Contract change
 
-None. No wire contract, envelope schema, or field policy was modified this round - V0R-H-01's fix corrects the *implementation* to match what `contracts/ipc_action_catalog.md` already specified; F-07/V0B-H-02 are new/hardened platform-layer code, not contract changes; F-08 is test-only.
+**This round**: yes, one - `contracts/json_field_policy.md` §4 was rewritten
+for `DEC-20260715-DATARESULT-GSON-PARITY`, a user-approved, DataResult-ONLY
+exception (documented in full above), scoped by explicit user decision
+rather than requiring a separate `CONTRACT_CHANGE_REQUEST` filing (the
+decision itself, made this round with the empirical evidence in hand, *is*
+the equivalent authorization). No other contract file changed; `jsonConfigDto`/
+`jsonDeviceDto`/the IPC envelope's existing strict policies are untouched.
+FG-M-01 is a build/test-hygiene fix, not a contract change.
+
+Prior rounds: none. No wire contract, envelope schema, or field policy was modified in those rounds - V0R-H-01's fix corrects the *implementation* to match what `contracts/ipc_action_catalog.md` already specified; F-07/V0B-H-02 are new/hardened platform-layer code, not contract changes; F-08 is test-only.
 
 ## Scope assertions
 
@@ -754,9 +904,22 @@ None. No wire contract, envelope schema, or field policy was modified this round
 
 ## Next dependency / handoff
 
-- Codex re-verification of this round's fixes (TC-H-01, TC-M-01, TC-L-01, TC-L-02, and all prior rounds' V0R-H-01/F-07/V0B-H-02/F-08/FINAL-M-01/FINAL-M-02/FINAL-L-01 fixes).
-- User review and Gate approval; `contract-v1` tag creation happens only after that.
-- Android baseline integrity recovery (see the dedicated section above) - a real, separate, unresolved audit item, tracked independently of this Foundation session's own completion (per FINAL-L-01, not a blocker on it).
-- **Required, not optional (TC-L-02)**: empirical verification of `DataResult`'s actual Gson 2.8.2 deserialization behavior on a real device/emulator, before `contract-v1` is tagged - see "Pre-tag compatibility evidence" above (`NOT_VERIFIABLE`, required before tag).
-- B-005 (RV1106 SDK/toolchain) resolution, whenever cross-build work is scheduled - target-validation-pending, separate from this session's own Gate (TC-L-02).
-- Wave 1 sessions (`CC-SENSOR-CORE`, `CC-SENSOR-STREAM`, and `CC-MGR-CORE`/`CC-MGR-SERVER` in the counterpart repo) can consume the FND-01~04 headers/codecs, including the new `savvy_ipc_reconnect_tracker_t` hook and `savvy_ipc_cancel_source_t` cancellation primitive, committed here. Wave 1's TCP-8140/BT-SPP adapter contract work (CC-MGR-CONNECTIVITY/CC-MGR-SERVER) is what will fill in `contracts/bt_spp.md`/`tcp_8140.md` (TC-L-02).
+- Codex final re-verification of this round's two items (DataResult Gson
+  parity, FG-M-01) and all prior rounds' fixes (TC-H-01/TC-M-01/TC-L-01/
+  TC-L-02, V0R-H-01/F-07/V0B-H-02/F-08, FINAL-M-01/FINAL-M-02/FINAL-L-01).
+- User review and Gate approval; `contract-v1` tag creation happens only
+  after that. With this round's two items closed, no other pre-tag item is
+  currently open in this document.
+- Android baseline integrity recovery (see the dedicated section above) - a
+  real, separate, unresolved audit item, tracked independently of this
+  Foundation session's own completion (per FINAL-L-01, not a blocker on it).
+- B-005 (RV1106 SDK/toolchain) resolution, whenever cross-build work is
+  scheduled - target-validation-pending, separate from this session's own
+  Gate.
+- Wave 1 sessions (`CC-SENSOR-CORE`, `CC-SENSOR-STREAM`, and `CC-MGR-CORE`/
+  `CC-MGR-SERVER` in the counterpart repo) can consume the FND-01~04
+  headers/codecs, including the new `savvy_ipc_reconnect_tracker_t` hook,
+  `savvy_ipc_cancel_source_t` cancellation primitive, and this round's
+  DataResult Gson-parity codec. Wave 1's TCP-8140/BT-SPP adapter contract
+  work (CC-MGR-CONNECTIVITY/CC-MGR-SERVER) is what will fill in `contracts/
+  bt_spp.md`/`tcp_8140.md`.
