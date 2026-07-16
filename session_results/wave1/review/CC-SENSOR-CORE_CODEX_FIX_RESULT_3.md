@@ -28,7 +28,8 @@
 | Review 3 artifact | `d2710a2f362caf54ebe30f358e613207c67e97a7` | 확인 |
 | Review 3 최신 파일 | `d2710a2f362caf54ebe30f358e613207c67e97a7` | 확인 |
 | Fix 3 구현 | `78e3c40d8dbd82a14ae7f3583a7f1b98cdde283f` | 확인 |
-| Fix 3 보고 artifact | `PENDING_REPORT_ARTIFACT_COMMIT` | artifact commit 뒤 확정 |
+| Fix 3 보고 artifact | `02549647fe89c84e73ea8c94b64c86b57594ab70` | 확인 |
+| Fix 3 보고 ledger | `PENDING_LEDGER_COMMIT` | 다음 Review에서 Git으로 확정 |
 
 ## 3. Finding 상태
 
@@ -146,4 +147,7 @@ feature-local 합계는 `3 + 5 + 2 + 1 + 2 + 2 = 15`다. 최종 test-only 보완
 - `AWAITING_CODEX_REVERIFY`
 
 FIX_3_REPORT_ARTIFACT_SHA:
-`PENDING_REPORT_ARTIFACT_COMMIT`
+`02549647fe89c84e73ea8c94b64c86b57594ab70`
+
+FIX_3_REPORT_LEDGER_SHA:
+`PENDING_LEDGER_COMMIT`
