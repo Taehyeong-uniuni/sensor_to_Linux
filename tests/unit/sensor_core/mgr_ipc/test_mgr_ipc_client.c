@@ -8,6 +8,9 @@
 
 #include "fake_transport.h"
 #include "mgr_ipc_client.h"
+#ifdef SENSOR_MGR_IPC_TESTING
+#include "mgr_ipc_test_hooks.h"
+#endif
 #include "savvy/protocol/ipc_envelope.h"
 #include "state_report.h"
 
@@ -20,12 +23,118 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define SENSOR_MGR_IPC_TEST_WITH_TSAN 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define SENSOR_MGR_IPC_TEST_WITH_TSAN 1
+#endif
+#ifndef SENSOR_MGR_IPC_TEST_WITH_TSAN
+#define SENSOR_MGR_IPC_TEST_WITH_TSAN 0
+#endif
+
 typedef struct callback_barrier {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     bool action_done;
     bool release_callback;
 } callback_barrier_t;
+
+#ifdef SENSOR_MGR_IPC_TESTING
+static struct timespec realtime_deadline(uint32_t timeout_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(timeout_ms / 1000u);
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return deadline;
+}
+
+typedef struct lifecycle_probe {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    sensor_mgr_ipc_client_t *client;
+    unsigned int counts[SENSOR_MGR_IPC_TEST_EVENT_COUNT];
+    bool blocked[SENSOR_MGR_IPC_TEST_EVENT_COUNT];
+    bool released[SENSOR_MGR_IPC_TEST_EVENT_COUNT];
+} lifecycle_probe_t;
+
+static void lifecycle_probe_hook(sensor_mgr_ipc_client_t *client,
+                                 sensor_mgr_ipc_test_event_t event,
+                                 void *user_data) {
+    lifecycle_probe_t *probe = (lifecycle_probe_t *)user_data;
+    assert(client == probe->client);
+    assert(event >= 0 && event < SENSOR_MGR_IPC_TEST_EVENT_COUNT);
+    pthread_mutex_lock(&probe->lock);
+    probe->counts[event] += 1;
+    pthread_cond_broadcast(&probe->cond);
+    while (probe->blocked[event] && !probe->released[event]) {
+        pthread_cond_wait(&probe->cond, &probe->lock);
+    }
+    pthread_mutex_unlock(&probe->lock);
+}
+
+static void lifecycle_probe_init(lifecycle_probe_t *probe,
+                                 sensor_mgr_ipc_client_t *client) {
+    assert(pthread_mutex_init(&probe->lock, NULL) == 0);
+    assert(pthread_cond_init(&probe->cond, NULL) == 0);
+    probe->client = client;
+    memset(probe->counts, 0, sizeof(probe->counts));
+    memset(probe->blocked, 0, sizeof(probe->blocked));
+    memset(probe->released, 0, sizeof(probe->released));
+    sensor_mgr_ipc_test_set_event_hook(lifecycle_probe_hook, probe);
+}
+
+static void lifecycle_probe_block(lifecycle_probe_t *probe,
+                                  sensor_mgr_ipc_test_event_t event) {
+    pthread_mutex_lock(&probe->lock);
+    probe->blocked[event] = true;
+    probe->released[event] = false;
+    pthread_mutex_unlock(&probe->lock);
+}
+
+static bool lifecycle_probe_wait(lifecycle_probe_t *probe,
+                                 sensor_mgr_ipc_test_event_t event,
+                                 unsigned int expected, uint32_t timeout_ms) {
+    struct timespec deadline = realtime_deadline(timeout_ms);
+    pthread_mutex_lock(&probe->lock);
+    while (probe->counts[event] < expected) {
+        if (pthread_cond_timedwait(&probe->cond, &probe->lock, &deadline) != 0) {
+            pthread_mutex_unlock(&probe->lock);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&probe->lock);
+    return true;
+}
+
+static unsigned int lifecycle_probe_count(lifecycle_probe_t *probe,
+                                          sensor_mgr_ipc_test_event_t event) {
+    pthread_mutex_lock(&probe->lock);
+    unsigned int count = probe->counts[event];
+    pthread_mutex_unlock(&probe->lock);
+    return count;
+}
+
+static void lifecycle_probe_release(lifecycle_probe_t *probe,
+                                    sensor_mgr_ipc_test_event_t event) {
+    pthread_mutex_lock(&probe->lock);
+    probe->released[event] = true;
+    pthread_cond_broadcast(&probe->cond);
+    pthread_mutex_unlock(&probe->lock);
+}
+
+static void lifecycle_probe_destroy(lifecycle_probe_t *probe) {
+    sensor_mgr_ipc_test_set_event_hook(NULL, NULL);
+    pthread_cond_destroy(&probe->cond);
+    pthread_mutex_destroy(&probe->lock);
+}
+#endif
 
 typedef struct test_recorder {
     pthread_mutex_t lock;
@@ -596,9 +705,79 @@ static long count_linux_threads(void) {
     return count;
 }
 
+static void *runtime_warmup_thread_main(void *arg) {
+    (void)arg;
+    return NULL;
+}
+
+static void warm_up_thread_runtime(void) {
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, runtime_warmup_thread_main, NULL) == 0);
+    assert(pthread_join(thread, NULL) == 0);
+}
+
+static long capture_stable_thread_baseline(void) {
+    long current = count_linux_threads();
+    if (current < 0) {
+        return -1;
+    }
+
+    int64_t deadline_ms = now_ms_test() + 2000;
+    if (!SENSOR_MGR_IPC_TEST_WITH_TSAN) {
+        /* A detached callback worker can finish its observable cleanup a
+         * fraction before the kernel removes its task entry. Preserve the
+         * direct production-process baseline of exactly one thread while
+         * waiting only on the measured resource state. */
+        while (current != 1 && now_ms_test() < deadline_ms) {
+            sleep_ms_test(1);
+            current = count_linux_threads();
+        }
+        assert(current == 1);
+        return current;
+    }
+
+    /* TSan owns a helper thread after pthread warm-up. Require a stable
+     * measured baseline rather than assuming how many runtime threads the
+     * sanitizer implementation uses. */
+    long candidate = current;
+    unsigned int stable_samples = 0;
+    while (stable_samples < 20 && now_ms_test() < deadline_ms) {
+        sleep_ms_test(1);
+        current = count_linux_threads();
+        if (current == candidate) {
+            stable_samples += 1;
+        } else {
+            candidate = current;
+            stable_samples = 0;
+        }
+    }
+    assert(stable_samples == 20);
+    return candidate;
+}
+
+static long wait_for_thread_baseline(long expected, uint32_t timeout_ms) {
+    long current = count_linux_threads();
+    if (expected < 0) {
+        return current;
+    }
+
+    int64_t deadline_ms = now_ms_test() + (int64_t)timeout_ms;
+    while (current != expected && now_ms_test() < deadline_ms) {
+        sleep_ms_test(1);
+        current = count_linux_threads();
+    }
+    return current;
+}
+
 static void test_006_repeated_connect_disconnect(void) {
+    /* Initialize sanitizer pthread helpers before process baselines. The
+     * fake connector's TLS signal below identifies the client-owned worker
+     * independently from any runtime helper thread. */
+    warm_up_thread_runtime();
+
     fake_connector_ctx_t connector_ctx;
     assert(fake_connector_init(&connector_ctx, 4) == SAVVY_OK);
+    assert(fake_connector_enable_worker_tracking(&connector_ctx) == SAVVY_OK);
 
     test_recorder_t recorder;
     recorder_init(&recorder);
@@ -606,10 +785,14 @@ static void test_006_repeated_connect_disconnect(void) {
     config.reconnect_backoff_ms = 1;
 
     long fds_baseline = count_open_fds();
-    long threads_baseline = count_linux_threads();
+    long threads_baseline = capture_stable_thread_baseline();
     sensor_mgr_ipc_client_t *client = NULL;
     assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
     assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
+    assert(fake_connector_wait_worker_started(&connector_ctx, 1, 2000));
+    assert(fake_connector_worker_started_count(&connector_ctx) == 1);
+    assert(fake_connector_worker_exited_count(&connector_ctx) == 0);
+    assert(fake_connector_worker_active_count(&connector_ctx) == 1);
 
     const int cycles = 500;
     long fds_before = -1;
@@ -622,8 +805,11 @@ static void test_006_repeated_connect_disconnect(void) {
         fake_mgr_recv(mgr_fd, buf, sizeof(buf), &len, 500); /* drain CONNECT handshake */
         if (i == 0) {
             threads_running = count_linux_threads();
-            if (threads_baseline >= 0) {
-                assert(threads_running == threads_baseline + 1);
+            if (threads_baseline >= 0 && !SENSOR_MGR_IPC_TEST_WITH_TSAN) {
+                /* Preserve the direct non-sanitized Linux 1 -> 2 -> 1
+                 * production-process assertion. */
+                assert(threads_baseline == 1);
+                assert(threads_running == 2);
             }
         }
         fake_mgr_close(mgr_fd);
@@ -640,15 +826,26 @@ static void test_006_repeated_connect_disconnect(void) {
     assert(fds_after <= fds_before + 4);
 
     assert(sensor_mgr_ipc_client_stop(client) == SAVVY_OK);
+    assert(fake_connector_wait_worker_exited(&connector_ctx, 1, 2000));
+    assert(fake_connector_worker_started_count(&connector_ctx) == 1);
+    assert(fake_connector_worker_exited_count(&connector_ctx) == 1);
+    assert(fake_connector_worker_active_count(&connector_ctx) == 0);
+    assert(fake_connector_connect_count(&connector_ctx) >= cycles);
     long fds_final = count_open_fds();
-    long threads_final = count_linux_threads();
+    long threads_final = wait_for_thread_baseline(threads_baseline, 2000);
     assert(fds_baseline >= 0 && fds_final >= 0);
     /* count_open_fds itself opens the directory it reads, so both samples
      * have the same one-descriptor measurement overhead. No client fd may
      * remain after stop/join. */
     assert(fds_final <= fds_baseline + 1);
     if (threads_baseline >= 0) {
-        assert(threads_final == threads_baseline);
+        if (SENSOR_MGR_IPC_TEST_WITH_TSAN) {
+            /* TSan helpers belong to the warmed process baseline; client
+             * ownership is proved by the TLS counters above. */
+            assert(threads_final == threads_baseline);
+        } else {
+            assert(threads_final == 1);
+        }
     }
     sensor_mgr_ipc_client_destroy(client);
     fake_connector_destroy(&connector_ctx);
@@ -661,6 +858,51 @@ typedef struct lifecycle_thread_arg {
     sensor_mgr_ipc_client_t *client;
     savvy_status_t status;
 } lifecycle_thread_arg_t;
+
+#ifdef SENSOR_MGR_IPC_TESTING
+typedef struct operation_latch {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    bool done;
+} operation_latch_t;
+
+typedef struct race_thread_arg {
+    sensor_mgr_ipc_client_t *client;
+    savvy_status_t status;
+    operation_latch_t *completion;
+} race_thread_arg_t;
+
+static void operation_latch_init(operation_latch_t *latch) {
+    assert(pthread_mutex_init(&latch->lock, NULL) == 0);
+    assert(pthread_cond_init(&latch->cond, NULL) == 0);
+    latch->done = false;
+}
+
+static void operation_latch_mark_done(operation_latch_t *latch) {
+    pthread_mutex_lock(&latch->lock);
+    latch->done = true;
+    pthread_cond_broadcast(&latch->cond);
+    pthread_mutex_unlock(&latch->lock);
+}
+
+static bool operation_latch_wait(operation_latch_t *latch, uint32_t timeout_ms) {
+    struct timespec deadline = realtime_deadline(timeout_ms);
+    pthread_mutex_lock(&latch->lock);
+    while (!latch->done) {
+        if (pthread_cond_timedwait(&latch->cond, &latch->lock, &deadline) != 0) {
+            pthread_mutex_unlock(&latch->lock);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&latch->lock);
+    return true;
+}
+
+static void operation_latch_destroy(operation_latch_t *latch) {
+    pthread_cond_destroy(&latch->cond);
+    pthread_mutex_destroy(&latch->lock);
+}
+#endif
 
 static void *stop_thread_main(void *arg) {
     lifecycle_thread_arg_t *thread_arg = (lifecycle_thread_arg_t *)arg;
@@ -688,6 +930,262 @@ static void *send_thread_main(void *arg) {
         "{\"SENSOR\":\"PIR\",\"STATE\":\"1\"}");
     return NULL;
 }
+
+#ifdef SENSOR_MGR_IPC_TESTING
+static void *race_start_thread_main(void *arg) {
+    race_thread_arg_t *thread_arg = (race_thread_arg_t *)arg;
+    thread_arg->status = sensor_mgr_ipc_client_start(thread_arg->client);
+    operation_latch_mark_done(thread_arg->completion);
+    return NULL;
+}
+
+static void *race_destroy_thread_main(void *arg) {
+    race_thread_arg_t *thread_arg = (race_thread_arg_t *)arg;
+    sensor_mgr_ipc_client_destroy(thread_arg->client);
+    thread_arg->status = SAVVY_OK;
+    operation_latch_mark_done(thread_arg->completion);
+    return NULL;
+}
+
+static void assert_batch_resource_baseline(long fds_baseline,
+                                           long threads_baseline) {
+    long fds_final = count_open_fds();
+    long threads_final = wait_for_thread_baseline(threads_baseline, 2000);
+    assert(fds_final == fds_baseline);
+    if (threads_baseline >= 0) {
+        assert(threads_final == threads_baseline);
+    }
+}
+
+static void test_stopped_start_destroy_destroy_wins(void) {
+    const int cycles = 500;
+    warm_up_thread_runtime();
+    long fds_baseline = count_open_fds();
+    long threads_baseline = capture_stable_thread_baseline();
+
+    for (int i = 0; i < cycles; i++) {
+        fake_connector_ctx_t connector_ctx;
+        assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+        connector_ctx.fail_all = true;
+        test_recorder_t recorder;
+        recorder_init(&recorder);
+        sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+        sensor_mgr_ipc_client_t *client = NULL;
+        assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+
+        lifecycle_probe_t probe;
+        lifecycle_probe_init(&probe, client);
+        lifecycle_probe_block(&probe, SENSOR_MGR_IPC_TEST_START_AFTER_DESTROY_CHECK);
+        operation_latch_t start_done;
+        operation_latch_t destroy_done;
+        operation_latch_init(&start_done);
+        operation_latch_init(&destroy_done);
+        race_thread_arg_t start_arg = {client, SAVVY_ERR_UNKNOWN, &start_done};
+        race_thread_arg_t destroy_arg = {client, SAVVY_ERR_UNKNOWN, &destroy_done};
+        pthread_t start_thread;
+        pthread_t destroy_thread;
+
+        assert(pthread_create(&start_thread, NULL, race_start_thread_main, &start_arg) == 0);
+        assert(lifecycle_probe_wait(&probe,
+                                    SENSOR_MGR_IPC_TEST_START_AFTER_DESTROY_CHECK,
+                                    1, 2000));
+        assert(pthread_create(&destroy_thread, NULL, race_destroy_thread_main,
+                              &destroy_arg) == 0);
+        assert(lifecycle_probe_wait(&probe, SENSOR_MGR_IPC_TEST_DESTROY_CLAIMED,
+                                    1, 2000));
+        lifecycle_probe_release(&probe, SENSOR_MGR_IPC_TEST_START_AFTER_DESTROY_CHECK);
+
+        assert(operation_latch_wait(&start_done, 2000));
+        assert(operation_latch_wait(&destroy_done, 2000));
+        assert(pthread_join(start_thread, NULL) == 0);
+        assert(pthread_join(destroy_thread, NULL) == 0);
+        assert(start_arg.status == SAVVY_ERR_INVALID_ARGUMENT);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_START_BEFORE_CANCEL_INIT) == 0);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_START_AFTER_WORKER_CREATE) == 0);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_WORKER_ENTERED) == 0);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_WORKER_FINISHED) == 0);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_CANCEL_INITIALIZED) == 0);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_CANCEL_DESTROYED) == 0);
+        assert(fake_connector_connect_count(&connector_ctx) == 0);
+        assert(fake_connector_close_count(&connector_ctx) == 0);
+
+        lifecycle_probe_destroy(&probe);
+        operation_latch_destroy(&start_done);
+        operation_latch_destroy(&destroy_done);
+        fake_connector_destroy(&connector_ctx);
+        pthread_mutex_destroy(&recorder.lock);
+    }
+
+    assert_batch_resource_baseline(fds_baseline, threads_baseline);
+    printf("SNS-CORE-007 stopped start/destroy destroy-wins: OK (%d cycles)\n",
+           cycles);
+}
+
+static void test_stopped_start_destroy_start_wins(void) {
+    const int cycles = 500;
+    warm_up_thread_runtime();
+    long fds_baseline = count_open_fds();
+    long threads_baseline = capture_stable_thread_baseline();
+
+    for (int i = 0; i < cycles; i++) {
+        fake_connector_ctx_t connector_ctx;
+        assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+        connector_ctx.fail_all = true;
+        test_recorder_t recorder;
+        recorder_init(&recorder);
+        sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+        config.connect_timeout_ms = 5000;
+        sensor_mgr_ipc_client_t *client = NULL;
+        assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+
+        lifecycle_probe_t probe;
+        lifecycle_probe_init(&probe, client);
+        sensor_mgr_ipc_test_event_t blocked_event =
+            (i % 2) == 0 ? SENSOR_MGR_IPC_TEST_START_BEFORE_CANCEL_INIT
+                         : SENSOR_MGR_IPC_TEST_START_AFTER_WORKER_CREATE;
+        lifecycle_probe_block(&probe, blocked_event);
+        operation_latch_t start_done;
+        operation_latch_t destroy_done;
+        operation_latch_init(&start_done);
+        operation_latch_init(&destroy_done);
+        race_thread_arg_t start_arg = {client, SAVVY_ERR_UNKNOWN, &start_done};
+        race_thread_arg_t destroy_arg = {client, SAVVY_ERR_UNKNOWN, &destroy_done};
+        pthread_t start_thread;
+        pthread_t destroy_thread;
+
+        assert(pthread_create(&start_thread, NULL, race_start_thread_main, &start_arg) == 0);
+        assert(lifecycle_probe_wait(&probe, blocked_event, 1, 2000));
+        assert(pthread_create(&destroy_thread, NULL, race_destroy_thread_main,
+                              &destroy_arg) == 0);
+        assert(lifecycle_probe_wait(&probe,
+                                    SENSOR_MGR_IPC_TEST_DESTROY_WAITING_TRANSITION,
+                                    1, 2000));
+        lifecycle_probe_release(&probe, blocked_event);
+
+        assert(operation_latch_wait(&start_done, 2000));
+        assert(operation_latch_wait(&destroy_done, 2000));
+        assert(pthread_join(start_thread, NULL) == 0);
+        assert(pthread_join(destroy_thread, NULL) == 0);
+        assert(start_arg.status == SAVVY_OK);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_START_AFTER_WORKER_CREATE) == 1);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_WORKER_ENTERED) == 1);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_WORKER_FINISHED) == 1);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_CANCEL_INITIALIZED) == 1);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_CANCEL_DESTROYED) == 1);
+        assert(fake_connector_close_count(&connector_ctx) == 0);
+
+        lifecycle_probe_destroy(&probe);
+        operation_latch_destroy(&start_done);
+        operation_latch_destroy(&destroy_done);
+        fake_connector_destroy(&connector_ctx);
+        pthread_mutex_destroy(&recorder.lock);
+    }
+
+    assert_batch_resource_baseline(fds_baseline, threads_baseline);
+    printf("SNS-CORE-007 stopped start/destroy start-wins: OK (%d cycles)\n",
+           cycles);
+}
+
+static void test_callback_stop_start_destroy_overlap(void) {
+    const int cycles = 500;
+    warm_up_thread_runtime();
+    long fds_baseline = count_open_fds();
+    long threads_baseline = capture_stable_thread_baseline();
+
+    for (int i = 0; i < cycles; i++) {
+        fake_connector_ctx_t connector_ctx;
+        assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+        assert(fake_connector_enable_worker_tracking(&connector_ctx) == SAVVY_OK);
+        test_recorder_t recorder;
+        recorder_init(&recorder);
+        callback_barrier_t callback_barrier;
+        callback_barrier_init(&callback_barrier);
+        sensor_mgr_ipc_config_t config = make_default_config(&connector_ctx, &recorder);
+        config.recv_poll_timeout_ms = 5;
+        sensor_mgr_ipc_client_t *client = NULL;
+        assert(sensor_mgr_ipc_client_create(&client, &config) == SAVVY_OK);
+
+        lifecycle_probe_t probe;
+        lifecycle_probe_init(&probe, client);
+        recorder.callback_client = client;
+        recorder.callback_lifecycle_action = 1;
+        recorder.callback_barrier = &callback_barrier;
+        assert(sensor_mgr_ipc_client_start(client) == SAVVY_OK);
+        int mgr_fd = fake_mgr_dequeue_fd(&connector_ctx);
+        assert(mgr_fd >= 0);
+        char buf[256];
+        size_t len = 0;
+        assert(fake_mgr_recv(mgr_fd, buf, sizeof(buf), &len, 2000));
+        assert(len > 0);
+        callback_barrier_wait_action(&callback_barrier);
+        assert(fake_connector_wait_worker_started(&connector_ctx, 1, 2000));
+
+        operation_latch_t start_done;
+        operation_latch_t destroy_done;
+        operation_latch_init(&start_done);
+        operation_latch_init(&destroy_done);
+        race_thread_arg_t start_arg = {client, SAVVY_ERR_UNKNOWN, &start_done};
+        race_thread_arg_t destroy_arg = {client, SAVVY_ERR_UNKNOWN, &destroy_done};
+        pthread_t start_thread;
+        pthread_t destroy_thread;
+        assert(pthread_create(&start_thread, NULL, race_start_thread_main, &start_arg) == 0);
+        assert(lifecycle_probe_wait(&probe, SENSOR_MGR_IPC_TEST_JOIN_CLAIMED,
+                                    1, 2000));
+        assert(pthread_create(&destroy_thread, NULL, race_destroy_thread_main,
+                              &destroy_arg) == 0);
+        assert(lifecycle_probe_wait(&probe, SENSOR_MGR_IPC_TEST_DESTROY_CLAIMED,
+                                    1, 2000));
+        assert(lifecycle_probe_wait(&probe, SENSOR_MGR_IPC_TEST_WAITING_JOIN,
+                                    1, 2000));
+        callback_barrier_release(&callback_barrier);
+
+        assert(operation_latch_wait(&start_done, 2000));
+        assert(operation_latch_wait(&destroy_done, 2000));
+        assert(pthread_join(start_thread, NULL) == 0);
+        assert(pthread_join(destroy_thread, NULL) == 0);
+        assert(start_arg.status == SAVVY_ERR_INVALID_ARGUMENT);
+        assert(fake_connector_wait_worker_exited(&connector_ctx, 1, 2000));
+        assert(fake_connector_worker_started_count(&connector_ctx) == 1);
+        assert(fake_connector_worker_exited_count(&connector_ctx) == 1);
+        assert(fake_connector_worker_active_count(&connector_ctx) == 0);
+        assert(fake_connector_connect_count(&connector_ctx) == 1);
+        assert(fake_connector_close_count(&connector_ctx) == 1);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_START_AFTER_WORKER_CREATE) == 1);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_WORKER_ENTERED) == 1);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_WORKER_FINISHED) == 1);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_CANCEL_INITIALIZED) == 1);
+        assert(lifecycle_probe_count(&probe,
+                                     SENSOR_MGR_IPC_TEST_CANCEL_DESTROYED) == 1);
+
+        fake_mgr_close(mgr_fd);
+        lifecycle_probe_destroy(&probe);
+        operation_latch_destroy(&start_done);
+        operation_latch_destroy(&destroy_done);
+        callback_barrier_destroy(&callback_barrier);
+        fake_connector_destroy(&connector_ctx);
+        pthread_mutex_destroy(&recorder.lock);
+    }
+
+    assert_batch_resource_baseline(fds_baseline, threads_baseline);
+    printf("SNS-CORE-007 callback-stop start/destroy overlap: OK (%d cycles)\n",
+           cycles);
+}
+#endif
 
 static void test_send_shutdown_race(void) {
     const int cycles = 250;
@@ -776,6 +1274,10 @@ static void test_callback_lifecycle_operations(void) {
         int scenario = i % 3;
         fake_connector_ctx_t connector_ctx;
         assert(fake_connector_init(&connector_ctx, 2) == SAVVY_OK);
+        /* Scenario 2 transfers terminal ownership to a detached callback
+         * worker. Track the worker itself so the next stress batch never
+         * samples a merely signalled-but-not-yet-exited predecessor. */
+        assert(fake_connector_enable_worker_tracking(&connector_ctx) == SAVVY_OK);
         test_recorder_t recorder;
         recorder_init(&recorder);
         callback_barrier_t barrier;
@@ -836,6 +1338,14 @@ static void test_callback_lifecycle_operations(void) {
             assert(wait_until_ge(get_disconnect_count, &recorder, 1, 2000));
         }
 
+        int expected_workers = scenario == 1 ? 2 : 1;
+        assert(fake_connector_wait_worker_exited(&connector_ctx,
+                                                 expected_workers, 2000));
+        assert(fake_connector_worker_started_count(&connector_ctx) ==
+               expected_workers);
+        assert(fake_connector_worker_exited_count(&connector_ctx) ==
+               expected_workers);
+        assert(fake_connector_worker_active_count(&connector_ctx) == 0);
         fake_mgr_close(mgr_fd);
         callback_barrier_destroy(&barrier);
         fake_connector_destroy(&connector_ctx);
@@ -959,6 +1469,11 @@ static void test_007_shutdown_wakes_blocked_operations(void) {
     test_concurrent_stop_destroy_stress();
     test_send_shutdown_race();
     test_callback_lifecycle_operations();
+#ifdef SENSOR_MGR_IPC_TESTING
+    test_stopped_start_destroy_destroy_wins();
+    test_stopped_start_destroy_start_wins();
+    test_callback_stop_start_destroy_overlap();
+#endif
 
     printf("SNS-CORE-007(mgr_ipc): OK\n");
 }

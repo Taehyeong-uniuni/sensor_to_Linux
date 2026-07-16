@@ -12,6 +12,10 @@
 #include "savvy/protocol/ipc_action_catalog.h"
 #include "savvy/protocol/ipc_envelope.h"
 
+#ifdef SENSOR_MGR_IPC_TESTING
+#include "mgr_ipc_test_hooks.h"
+#endif
+
 typedef enum sensor_mgr_ipc_connection_state {
     SENSOR_MGR_IPC_DISCONNECTED = 0,
     SENSOR_MGR_IPC_TRANSPORT_CONNECTED,
@@ -58,6 +62,33 @@ static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_registry_idle = PTHREAD_COND_INITIALIZER;
 static sensor_mgr_ipc_client_t *g_registry_clients = NULL;
 
+#ifdef SENSOR_MGR_IPC_TESTING
+static pthread_mutex_t g_test_hook_lock = PTHREAD_MUTEX_INITIALIZER;
+static sensor_mgr_ipc_test_event_hook_fn g_test_hook = NULL;
+static void *g_test_hook_user_data = NULL;
+
+void sensor_mgr_ipc_test_set_event_hook(sensor_mgr_ipc_test_event_hook_fn hook,
+                                        void *user_data) {
+    pthread_mutex_lock(&g_test_hook_lock);
+    g_test_hook = hook;
+    g_test_hook_user_data = user_data;
+    pthread_mutex_unlock(&g_test_hook_lock);
+}
+
+static void invoke_test_hook(sensor_mgr_ipc_client_t *client,
+                             sensor_mgr_ipc_test_event_t event) {
+    pthread_mutex_lock(&g_test_hook_lock);
+    sensor_mgr_ipc_test_event_hook_fn hook = g_test_hook;
+    void *user_data = g_test_hook_user_data;
+    pthread_mutex_unlock(&g_test_hook_lock);
+    if (hook != NULL) {
+        hook(client, event, user_data);
+    }
+}
+#else
+#define invoke_test_hook(client, event) ((void)(client))
+#endif
+
 static void *worker_main(void *arg);
 static void finalize_destroy(sensor_mgr_ipc_client_t *client);
 
@@ -98,25 +129,45 @@ static void client_leave(sensor_mgr_ipc_client_t *client) {
     pthread_mutex_unlock(&g_registry_lock);
 }
 
-static bool client_claim_destroy(sensor_mgr_ipc_client_t *client, bool from_worker) {
+static bool client_claim_destroy(sensor_mgr_ipc_client_t *client,
+                                 bool *out_from_worker) {
+    /* lifecycle_lock serializes the destroy claim with start's authoritative
+     * destroy check and all start side effects. The nested order is always
+     * lifecycle_lock -> g_registry_lock; pin drain never holds lifecycle. */
+#ifdef SENSOR_MGR_IPC_TESTING
+    if (pthread_mutex_trylock(&client->lifecycle_lock) != 0) {
+        invoke_test_hook(client, SENSOR_MGR_IPC_TEST_DESTROY_WAITING_TRANSITION);
+        pthread_mutex_lock(&client->lifecycle_lock);
+    }
+#else
+    pthread_mutex_lock(&client->lifecycle_lock);
+#endif
+    bool from_worker = client->started &&
+                       pthread_equal(pthread_self(), client->worker_thread);
     pthread_mutex_lock(&g_registry_lock);
     if (client->destroy_requested) {
         pthread_mutex_unlock(&g_registry_lock);
+        pthread_mutex_unlock(&client->lifecycle_lock);
         return false;
     }
     client->destroy_requested = true;
     client->destroy_from_worker = from_worker;
     pthread_cond_broadcast(&g_registry_idle);
     pthread_mutex_unlock(&g_registry_lock);
+    pthread_mutex_unlock(&client->lifecycle_lock);
+    *out_from_worker = from_worker;
+    invoke_test_hook(client, SENSOR_MGR_IPC_TEST_DESTROY_CLAIMED);
     return true;
 }
 
 static void client_unclaim_destroy(sensor_mgr_ipc_client_t *client) {
+    pthread_mutex_lock(&client->lifecycle_lock);
     pthread_mutex_lock(&g_registry_lock);
     client->destroy_requested = false;
     client->destroy_from_worker = false;
     pthread_cond_broadcast(&g_registry_idle);
     pthread_mutex_unlock(&g_registry_lock);
+    pthread_mutex_unlock(&client->lifecycle_lock);
 }
 
 static bool client_destroy_is_requested(sensor_mgr_ipc_client_t *client) {
@@ -147,13 +198,6 @@ static void registry_remove_and_wait(sensor_mgr_ipc_client_t *client) {
         *link = client->registry_next;
     }
     pthread_mutex_unlock(&g_registry_lock);
-}
-
-static bool caller_is_worker(sensor_mgr_ipc_client_t *client) {
-    pthread_mutex_lock(&client->lifecycle_lock);
-    bool is_worker = client->started && pthread_equal(pthread_self(), client->worker_thread);
-    pthread_mutex_unlock(&client->lifecycle_lock);
-    return is_worker;
 }
 
 static void close_transport(sensor_mgr_ipc_client_t *client) {
@@ -191,6 +235,7 @@ static void worker_mark_finished(sensor_mgr_ipc_client_t *client) {
      * until the worker-owned cancel source has actually been destroyed. */
     if (destroy_cancel) {
         savvy_ipc_cancel_source_destroy(&client->cancel_source);
+        invoke_test_hook(client, SENSOR_MGR_IPC_TEST_CANCEL_DESTROYED);
     }
 
     pthread_mutex_lock(&client->lifecycle_lock);
@@ -202,6 +247,8 @@ static void worker_mark_finished(sensor_mgr_ipc_client_t *client) {
     destroy_after_cleanup = client->destroy_from_worker;
     pthread_cond_broadcast(&client->shutdown_cond);
     pthread_mutex_unlock(&client->lifecycle_lock);
+
+    invoke_test_hook(client, SENSOR_MGR_IPC_TEST_WORKER_FINISHED);
 
     if (destroy_after_cleanup) {
         /* A callback-triggered destroy runs on this worker.  It was
@@ -248,6 +295,7 @@ static savvy_status_t stop_impl(sensor_mgr_ipc_client_t *client) {
 
     if (client->join_in_progress) {
         while (!client->stop_complete) {
+            invoke_test_hook(client, SENSOR_MGR_IPC_TEST_WAITING_JOIN);
             pthread_cond_wait(&client->shutdown_cond, &client->lifecycle_lock);
         }
         pthread_mutex_unlock(&client->lifecycle_lock);
@@ -255,6 +303,7 @@ static savvy_status_t stop_impl(sensor_mgr_ipc_client_t *client) {
     }
 
     client->join_in_progress = true;
+    invoke_test_hook(client, SENSOR_MGR_IPC_TEST_JOIN_CLAIMED);
     worker = client->worker_thread;
     do_join = true;
     pthread_mutex_unlock(&client->lifecycle_lock);
@@ -335,6 +384,25 @@ savvy_status_t sensor_mgr_ipc_client_start(sensor_mgr_ipc_client_t *client) {
         }
         if (!client->started) {
             pthread_mutex_unlock(&client->lifecycle_lock);
+            if (client_destroy_is_requested(client)) {
+                client_leave(client);
+                return SAVVY_ERR_INVALID_ARGUMENT;
+            }
+            invoke_test_hook(client, SENSOR_MGR_IPC_TEST_START_AFTER_DESTROY_CHECK);
+
+            pthread_mutex_lock(&client->lifecycle_lock);
+            if (client->started) {
+                pthread_mutex_unlock(&client->lifecycle_lock);
+                continue;
+            }
+            /* This check is authoritative: destroy claim uses the same
+             * lifecycle lock, so false remains valid through init/create
+             * and publication of started=true below. */
+            if (client_destroy_is_requested(client)) {
+                pthread_mutex_unlock(&client->lifecycle_lock);
+                client_leave(client);
+                return SAVVY_ERR_INVALID_ARGUMENT;
+            }
             break;
         }
         bool self_worker = pthread_equal(pthread_self(), client->worker_thread);
@@ -350,17 +418,9 @@ savvy_status_t sensor_mgr_ipc_client_start(sensor_mgr_ipc_client_t *client) {
         }
     }
 
-    if (client_destroy_is_requested(client)) {
-        client_leave(client);
-        return SAVVY_ERR_INVALID_ARGUMENT;
-    }
-
-    pthread_mutex_lock(&client->lifecycle_lock);
-    if (client->started) {
-        pthread_mutex_unlock(&client->lifecycle_lock);
-        client_leave(client);
-        return SAVVY_OK;
-    }
+    /* lifecycle_lock is intentionally retained from the authoritative
+     * check above until all start side effects are published. */
+    invoke_test_hook(client, SENSOR_MGR_IPC_TEST_START_BEFORE_CANCEL_INIT);
     savvy_status_t st = savvy_ipc_cancel_source_init(&client->cancel_source);
     if (st != SAVVY_OK) {
         pthread_mutex_unlock(&client->lifecycle_lock);
@@ -368,6 +428,7 @@ savvy_status_t sensor_mgr_ipc_client_start(sensor_mgr_ipc_client_t *client) {
         return st;
     }
     client->cancel_initialized = true;
+    invoke_test_hook(client, SENSOR_MGR_IPC_TEST_CANCEL_INITIALIZED);
     savvy_ipc_reconnect_tracker_init(&client->reconnect_tracker);
     client->shutdown_requested = false;
     client->stop_complete = false;
@@ -379,10 +440,12 @@ savvy_status_t sensor_mgr_ipc_client_start(sensor_mgr_ipc_client_t *client) {
         client->cancel_initialized = false;
         client->stop_complete = true;
         savvy_ipc_cancel_source_destroy(&client->cancel_source);
+        invoke_test_hook(client, SENSOR_MGR_IPC_TEST_CANCEL_DESTROYED);
         pthread_mutex_unlock(&client->lifecycle_lock);
         client_leave(client);
         return SAVVY_ERR_UNKNOWN;
     }
+    invoke_test_hook(client, SENSOR_MGR_IPC_TEST_START_AFTER_WORKER_CREATE);
     client->started = true;
     pthread_mutex_unlock(&client->lifecycle_lock);
     client_leave(client);
@@ -461,8 +524,8 @@ void sensor_mgr_ipc_client_destroy(sensor_mgr_ipc_client_t *client) {
         return;
     }
 
-    bool self_worker = caller_is_worker(client);
-    if (!client_claim_destroy(client, self_worker)) {
+    bool self_worker = false;
+    if (!client_claim_destroy(client, &self_worker)) {
         client_leave(client);
         return;
     }
@@ -600,6 +663,7 @@ static void notify_disconnected(sensor_mgr_ipc_client_t *client) {
 
 static void *worker_main(void *arg) {
     sensor_mgr_ipc_client_t *client = (sensor_mgr_ipc_client_t *)arg;
+    invoke_test_hook(client, SENSOR_MGR_IPC_TEST_WORKER_ENTERED);
 
     while (!is_shutdown_requested(client)) {
         savvy_ipc_transport_t transport;

@@ -104,20 +104,56 @@ endif()
 if(SAVVY_BUILD_TESTS)
     enable_testing()
 
-    add_executable(test_sensor_core_mgr_ipc
+    set(SENSOR_MGR_IPC_UNIT_TEST_SOURCES
         ${SAVVY_REPO_ROOT}/tests/unit/sensor_core/mgr_ipc/test_mgr_ipc_client.c
         ${SAVVY_REPO_ROOT}/tests/unit/sensor_core/mgr_ipc/fake_transport.c
         ${SAVVY_REPO_ROOT}/src/features/state_report/state_report.c
+    )
+
+    add_executable(test_sensor_core_mgr_ipc
+        ${SENSOR_MGR_IPC_UNIT_TEST_SOURCES}
     )
     target_include_directories(test_sensor_core_mgr_ipc PRIVATE
         ${SAVVY_REPO_ROOT}/src/features/state_report
     )
     target_link_libraries(test_sensor_core_mgr_ipc PRIVATE sensor_core_mgr_ipc)
+
+    # Lifecycle race tests need deterministic probes inside start/destroy.
+    # Compile a test-only copy so the production archive and tests-off
+    # builds expose no instrumentation symbols or branches.
+    add_library(sensor_core_mgr_ipc_testable STATIC mgr_ipc_client.c)
+    target_compile_definitions(sensor_core_mgr_ipc_testable PRIVATE SENSOR_MGR_IPC_TESTING=1)
+    target_include_directories(sensor_core_mgr_ipc_testable
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+        PRIVATE ${SAVVY_REPO_ROOT}/tests/unit/sensor_core/mgr_ipc
+    )
+    target_link_libraries(sensor_core_mgr_ipc_testable
+        PUBLIC savvy_protocol savvy_core savvy_platform_interfaces
+    )
+    if(SENSOR_MGR_IPC_REAL_TRANSPORT)
+        target_link_libraries(sensor_core_mgr_ipc_testable PUBLIC savvy_platform_ipc)
+    else()
+        target_sources(sensor_core_mgr_ipc_testable PRIVATE cancel_source_portable.c)
+    endif()
+
+    add_executable(test_sensor_core_mgr_ipc_lifecycle
+        ${SENSOR_MGR_IPC_UNIT_TEST_SOURCES}
+    )
+    target_compile_definitions(test_sensor_core_mgr_ipc_lifecycle
+        PRIVATE SENSOR_MGR_IPC_TESTING=1
+    )
+    target_include_directories(test_sensor_core_mgr_ipc_lifecycle PRIVATE
+        ${SAVVY_REPO_ROOT}/src/features/state_report
+    )
+    target_link_libraries(test_sensor_core_mgr_ipc_lifecycle
+        PRIVATE sensor_core_mgr_ipc_testable
+    )
+
     add_test(NAME SNS-CORE-003a COMMAND test_sensor_core_mgr_ipc 003a)
     add_test(NAME SNS-CORE-003b-mgr-ipc COMMAND test_sensor_core_mgr_ipc 003b)
     add_test(NAME CT-IPC-002 COMMAND test_sensor_core_mgr_ipc ct-ipc-002)
     add_test(NAME SNS-CORE-006 COMMAND test_sensor_core_mgr_ipc 006)
-    add_test(NAME SNS-CORE-007-mgr-ipc COMMAND test_sensor_core_mgr_ipc 007)
+    add_test(NAME SNS-CORE-007-mgr-ipc COMMAND test_sensor_core_mgr_ipc_lifecycle 007)
 
     # Real-transport integration test (Linux Docker only): needs a
     # pre-built tools/mock_mgr binary, since that tool is its own

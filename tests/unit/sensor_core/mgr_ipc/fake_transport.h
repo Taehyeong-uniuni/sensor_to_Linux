@@ -27,6 +27,13 @@ typedef struct fake_connector_ctx {
     bool fail_all;              /* true => every call simulates "server not reachable yet" (SAVVY_ERR_TIMEOUT), no socketpair created */
     pthread_mutex_t lock;
     pthread_cond_t send_cond;
+    pthread_key_t worker_key;
+    bool worker_tracking_enabled;
+    bool worker_key_initialized;
+    int worker_started_count;
+    int worker_exited_count;
+    int worker_active_count;
+    int connect_count;
     size_t send_failures_remaining;
     savvy_status_t send_failure_status;
     int close_count;
@@ -46,6 +53,15 @@ bool fake_connector_wait_send_blocked(fake_connector_ctx_t *ctx, uint32_t timeou
 void fake_connector_release_blocked_send(fake_connector_ctx_t *ctx);
 bool fake_connector_wait_close_count(fake_connector_ctx_t *ctx, int expected,
                                      uint32_t timeout_ms);
+savvy_status_t fake_connector_enable_worker_tracking(fake_connector_ctx_t *ctx);
+bool fake_connector_wait_worker_started(fake_connector_ctx_t *ctx, int expected,
+                                        uint32_t timeout_ms);
+bool fake_connector_wait_worker_exited(fake_connector_ctx_t *ctx, int expected,
+                                       uint32_t timeout_ms);
+int fake_connector_worker_started_count(fake_connector_ctx_t *ctx);
+int fake_connector_worker_exited_count(fake_connector_ctx_t *ctx);
+int fake_connector_worker_active_count(fake_connector_ctx_t *ctx);
+int fake_connector_connect_count(fake_connector_ctx_t *ctx);
 
 /* sensor_mgr_ipc_connector_fn-compatible. */
 savvy_status_t fake_connector_connect(void *connector_ctx, uint32_t timeout_ms,

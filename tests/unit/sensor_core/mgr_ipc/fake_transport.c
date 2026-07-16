@@ -81,6 +81,15 @@ typedef struct fake_transport_impl {
     fake_connector_ctx_t *ctx;
 } fake_transport_impl_t;
 
+static void worker_tracking_destructor(void *value) {
+    fake_connector_ctx_t *ctx = (fake_connector_ctx_t *)value;
+    pthread_mutex_lock(&ctx->lock);
+    ctx->worker_exited_count += 1;
+    ctx->worker_active_count -= 1;
+    pthread_cond_broadcast(&ctx->send_cond);
+    pthread_mutex_unlock(&ctx->lock);
+}
+
 static savvy_status_t fd_transport_send(savvy_ipc_transport_t *self, const void *buf, size_t len, uint32_t timeout_ms) {
     (void)timeout_ms;
     fake_transport_impl_t *impl = (fake_transport_impl_t *)self->impl;
@@ -185,6 +194,13 @@ static void fd_transport_close(savvy_ipc_transport_t *self) {
 
 savvy_status_t fake_connector_init(fake_connector_ctx_t *ctx, size_t queue_capacity) {
     ctx->fail_all = false;
+    ctx->worker_key = (pthread_key_t)0;
+    ctx->worker_tracking_enabled = false;
+    ctx->worker_key_initialized = false;
+    ctx->worker_started_count = 0;
+    ctx->worker_exited_count = 0;
+    ctx->worker_active_count = 0;
+    ctx->connect_count = 0;
     ctx->send_failures_remaining = 0;
     ctx->send_failure_status = SAVVY_ERR_IO;
     ctx->close_count = 0;
@@ -210,6 +226,9 @@ savvy_status_t fake_connector_init(fake_connector_ctx_t *ctx, size_t queue_capac
 void fake_connector_destroy(fake_connector_ctx_t *ctx) {
     savvy_queue_close(&ctx->mgr_fd_queue);
     savvy_queue_destroy(&ctx->mgr_fd_queue);
+    if (ctx->worker_key_initialized) {
+        pthread_key_delete(ctx->worker_key);
+    }
     pthread_cond_destroy(&ctx->send_cond);
     pthread_mutex_destroy(&ctx->lock);
 }
@@ -293,10 +312,102 @@ bool fake_connector_wait_close_count(fake_connector_ctx_t *ctx, int expected,
     return true;
 }
 
+savvy_status_t fake_connector_enable_worker_tracking(fake_connector_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    if (!ctx->worker_key_initialized) {
+        if (pthread_key_create(&ctx->worker_key, worker_tracking_destructor) != 0) {
+            pthread_mutex_unlock(&ctx->lock);
+            return SAVVY_ERR_UNKNOWN;
+        }
+        ctx->worker_key_initialized = true;
+    }
+    ctx->worker_tracking_enabled = true;
+    pthread_mutex_unlock(&ctx->lock);
+    return SAVVY_OK;
+}
+
+static bool wait_worker_count(fake_connector_ctx_t *ctx, int expected,
+                              bool wait_for_exit, uint32_t timeout_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(timeout_ms / 1000u);
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+    int *count = wait_for_exit ? &ctx->worker_exited_count : &ctx->worker_started_count;
+    while (*count < expected) {
+        if (pthread_cond_timedwait(&ctx->send_cond, &ctx->lock, &deadline) != 0) {
+            pthread_mutex_unlock(&ctx->lock);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return true;
+}
+
+bool fake_connector_wait_worker_started(fake_connector_ctx_t *ctx, int expected,
+                                        uint32_t timeout_ms) {
+    return wait_worker_count(ctx, expected, false, timeout_ms);
+}
+
+bool fake_connector_wait_worker_exited(fake_connector_ctx_t *ctx, int expected,
+                                       uint32_t timeout_ms) {
+    return wait_worker_count(ctx, expected, true, timeout_ms);
+}
+
+int fake_connector_worker_started_count(fake_connector_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    int count = ctx->worker_started_count;
+    pthread_mutex_unlock(&ctx->lock);
+    return count;
+}
+
+int fake_connector_worker_exited_count(fake_connector_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    int count = ctx->worker_exited_count;
+    pthread_mutex_unlock(&ctx->lock);
+    return count;
+}
+
+int fake_connector_worker_active_count(fake_connector_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    int count = ctx->worker_active_count;
+    pthread_mutex_unlock(&ctx->lock);
+    return count;
+}
+
+int fake_connector_connect_count(fake_connector_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    int count = ctx->connect_count;
+    pthread_mutex_unlock(&ctx->lock);
+    return count;
+}
+
 savvy_status_t fake_connector_connect(void *connector_ctx, uint32_t timeout_ms,
                                        const savvy_ipc_cancel_source_t *cancel,
                                        savvy_ipc_transport_t *out_transport) {
     fake_connector_ctx_t *ctx = (fake_connector_ctx_t *)connector_ctx;
+
+    pthread_mutex_lock(&ctx->lock);
+    ctx->connect_count += 1;
+    bool track_worker = ctx->worker_tracking_enabled;
+    pthread_key_t worker_key = ctx->worker_key;
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (track_worker && pthread_getspecific(worker_key) == NULL) {
+        if (pthread_setspecific(worker_key, ctx) != 0) {
+            return SAVVY_ERR_UNKNOWN;
+        }
+        pthread_mutex_lock(&ctx->lock);
+        ctx->worker_started_count += 1;
+        ctx->worker_active_count += 1;
+        pthread_cond_broadcast(&ctx->send_cond);
+        pthread_mutex_unlock(&ctx->lock);
+    }
 
     if (cancel != NULL && savvy_ipc_cancel_source_is_cancelled(cancel)) {
         return SAVVY_ERR_CANCELLED;

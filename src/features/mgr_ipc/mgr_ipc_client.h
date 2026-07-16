@@ -30,8 +30,10 @@ extern "C" {
  * (declared in real_connector.h, only built when this feature's own
  * SENSOR_MGR_IPC_REAL_TRANSPORT CMake option is ON), and tests supply a
  * fake one. This is a plain dependency-injection seam, not a production
- * mock: nothing here behaves differently based on who supplies the
- * connector, and no test-only code path exists inside this client. */
+ * mock: production behavior does not vary with the connector supplier.
+ * Deterministic lifecycle probes are compiled only into the separate
+ * SENSOR_MGR_IPC_TESTING target and are absent from the production
+ * sensor_core_mgr_ipc archive. */
 
 typedef savvy_status_t (*sensor_mgr_ipc_connector_fn)(void *connector_ctx,
                                                        uint32_t timeout_ms,
