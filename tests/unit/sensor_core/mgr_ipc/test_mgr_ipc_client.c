@@ -228,7 +228,7 @@ static void on_disconnected_cb(void *ud) {
 }
 
 static void on_envelope_cb(const char *action, const char *payload_json, void *ud) {
-    (void)payload_json;
+    CHECK(payload_json != NULL, "envelope callback receives a payload");
     test_recorder_t *r = (test_recorder_t *)ud;
     pthread_mutex_lock(&r->lock);
     if (r->action_count < 32) {
@@ -717,19 +717,23 @@ static long count_linux_threads(void) {
 }
 
 static void *runtime_warmup_thread_main(void *arg) {
-    (void)arg;
+    bool *thread_ran = (bool *)arg;
+    *thread_ran = true;
     return NULL;
 }
 
 static void warm_up_thread_runtime(void) {
+    bool thread_ran = false;
     pthread_t thread;
-    int thread_create_rc = pthread_create(&thread, NULL, runtime_warmup_thread_main, NULL);
+    int thread_create_rc = pthread_create(&thread, NULL, runtime_warmup_thread_main,
+                                          &thread_ran);
     CHECK(thread_create_rc == 0, "pthread_create(thread) succeeds");
     bool thread_created = (thread_create_rc == 0);
     if (thread_created) {
         int thread_join_rc = pthread_join(thread, NULL);
         CHECK(thread_join_rc == 0, "pthread_join(thread) succeeds");
     }
+    CHECK(thread_ran, "runtime warmup thread executes before join completes");
 }
 
 static long capture_stable_thread_baseline(void) {
