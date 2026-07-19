@@ -242,11 +242,17 @@ static void test_008(void)
     echo_ctx_t ctx = {0};
     CHECK(make_listener(&ctx.l), "create echo listener for 008");
     ctx.expected_connections = 50;
-    pthread_t th;
-    pthread_create(&th, NULL, echo_accept_thread, &ctx);
 
+    /* Probe the baseline before spawning the echo server thread: a freshly
+     * created thread's own startup (e.g. the sanitizer runtime registering
+     * its stack) can transiently hold an extra fd open, which would race
+     * this dup(0) probe and inflate the baseline with a fd that belongs to
+     * thread start-up, not to anything the test is trying to measure. */
     int fd_probe_before = dup(0);
     close(fd_probe_before);
+
+    pthread_t th;
+    pthread_create(&th, NULL, echo_accept_thread, &ctx);
 
     for (int i = 0; i < 50; i++) {
         sensor_tcp_channel_t *ch = NULL;
@@ -263,11 +269,19 @@ static void test_008(void)
         sensor_tcp_channel_destroy(ch); /* stop() + close socket + join thread + free */
     }
 
+    /* Symmetrically, join the echo server thread before probing the final
+     * fd state: it owns and closes its own accepted fd internally, once per
+     * connection (see echo_accept_thread), so probing first would race that
+     * last close() against this thread and could observe a still-open fd
+     * that belongs to the test's own mock server, not to the channel under
+     * test. */
+    int join_rc = pthread_join(th, NULL);
+    CHECK(join_rc == 0, "echo server thread joined cleanly after all 50 connections");
+
     int fd_probe_after = dup(0);
     close(fd_probe_after);
     CHECK(fd_probe_after == fd_probe_before, "no fd leak across 50 create/start/submit/destroy cycles");
 
-    pthread_join(th, NULL);
     close(ctx.l.listen_fd);
 }
 
