@@ -1,0 +1,42 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "host-mac",
+      "displayName": "macOS host: packet/JSON/core/mock IPC contract tests",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/host-mac",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SAVVY_IPC_REAL_TRANSPORT": "OFF"
+      }
+    },
+    {
+      "name": "host-linux",
+      "displayName": "Docker Ubuntu 22.04: real AF_UNIX SOCK_SEQPACKET transport",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/host-linux",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SAVVY_IPC_REAL_TRANSPORT": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "host-mac", "configurePreset": "host-mac" },
+    { "name": "host-linux", "configurePreset": "host-linux" }
+  ],
+  "testPresets": [
+    {
+      "name": "host-mac",
+      "configurePreset": "host-mac",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "host-linux",
+      "configurePreset": "host-linux",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

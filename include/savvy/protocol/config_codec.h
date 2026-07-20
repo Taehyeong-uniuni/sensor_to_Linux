@@ -1,0 +1,87 @@
+#ifndef SAVVY_PROTOCOL_CONFIG_CODEC_H
+#define SAVVY_PROTOCOL_CONFIG_CODEC_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "savvy/core/error.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Generous fixed bound for every string field below (longest observed
+ * real value is a 14-char IP address); parse rejects rather than
+ * silently truncates any value that would not fit. */
+#define SAVVY_CONFIG_STR_LEN 64
+
+/* jsonConfigDto (contracts/json_field_policy.md §2) - field order and
+ * names mirror the Android DTO; C field names are the JSON key in
+ * snake_case. */
+typedef struct savvy_config {
+    char server_ip[SAVVY_CONFIG_STR_LEN];
+    char ftp_ip[SAVVY_CONFIG_STR_LEN];
+    char select_wifi[SAVVY_CONFIG_STR_LEN];
+    char select_beacon[SAVVY_CONFIG_STR_LEN];
+    int32_t video_time;
+    int32_t frame;
+    int32_t danger_count;
+    int32_t decibel;
+    int32_t inout_time;
+    int32_t buzzer_time;
+    int32_t pixel_count;
+    int32_t milli_meter;
+    char sending_log_time[SAVVY_CONFIG_STR_LEN];
+    int32_t keep_alive_time;
+    char keep_server_ip[SAVVY_CONFIG_STR_LEN];
+    char boot_auto_time[SAVVY_CONFIG_STR_LEN];
+    int32_t compress;
+    int32_t fracture_frame_pixel;
+    int32_t fracture_frame_cnt;
+    int32_t reset_frame_pixel;
+    int32_t reset_frame_cnt;
+    int32_t same_frame_pixel;
+    int32_t same_frame_cnt;
+    int32_t alert_smoke;
+    int32_t use_rknn;
+    int32_t volume;
+    int32_t buzzer_on_stream;
+    int32_t buzzer_on_voice;
+    int32_t buzzer_on_beacon;
+    int32_t buzzer_on_smoke;
+} savvy_config_t;
+
+/* Populates *out with this repo's own app's Android source defaults
+ * (JsonConfigDto Java field initializers, sensor_to_Linux -> savvy_sensor's
+ * compiled value: keep_server_ip = "13.125.173.114"). savvy_mgr's own
+ * JsonConfigDto compiles a DIFFERENT default for this one field
+ * (15.165.113.212) - a real, independently-duplicated-model drift between
+ * the two Android apps, not a typo on either side (see contracts/
+ * json_field_policy.md §5 drift #1). Each repo's Foundation code matches
+ * its OWN app's Android source; reconciling the two apps' values (if
+ * that's even desired) is a separate production/SCOPE_CHANGE_REQUEST
+ * decision, not resolved here. */
+void savvy_config_set_defaults(savvy_config_t *out);
+
+/* Parses `json` (`len` bytes, NUL-terminated at json[len]) into *out,
+ * which must already be initialized (typically via
+ * savvy_config_set_defaults()). Missing keys leave *out's existing value
+ * untouched. Rejects (SAVVY_ERR_PROTOCOL): JSON null for any known field,
+ * wrong JSON type for any known field, a fractional/non-finite/out-of-
+ * INT32-range number for an integer field, a string value too long for
+ * its fixed buffer, invalid UTF-8 anywhere in the tree, and any duplicate
+ * key anywhere in the tree. Unknown extra keys are ignored (per
+ * contracts/json_field_policy.md "unknown key: ignore + log"); if
+ * `unknown_key_log_fn` is non-NULL, it is invoked once per unknown key
+ * with ("jsonConfigDto", key_name) - never the key's value. */
+savvy_status_t savvy_config_parse(const char *json, size_t len, savvy_config_t *out,
+                                   void (*unknown_key_log_fn)(const char *object_name, const char *key_name));
+
+/* Builds *cfg into a newly malloc'd, NUL-terminated JSON string
+ * (*out_json; caller frees with free()). */
+savvy_status_t savvy_config_build(const savvy_config_t *cfg, char **out_json);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
